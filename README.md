@@ -71,7 +71,9 @@ local draw = require("draw")
 draw.open(256, 128)
 draw.clear(27, 27, 27)
 draw.circle(128, 64, 30, 255, 80, 40)
-while draw.pres() do end
+while draw.pres() do
+ --ваш код
+end
 draw.close()
 ```
 
