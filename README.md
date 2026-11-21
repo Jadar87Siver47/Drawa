@@ -520,9 +520,6 @@ sudo apt install libsdl2-dev liblua5.4-dev
 - `draw.c` — исходный код модуля.
 - `CMakeLists.txt` — сборка через CMake.
 - `test.lua` — минимальный тест.
-- `example.lua` — пример с палитрой, фигурами, спрайтами и анимацией.
-- `draw.so` — собранный модуль (Linux).
-- `build/draw.so` — результат CMake-сборки.
 
 ## Благодарности
 
