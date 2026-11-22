@@ -71,6 +71,9 @@ typedef struct {
     int fps;
     int vsync;
     Uint64 last_tick;
+    Uint64 prev_frame;
+    int has_prev_frame;
+    double frame_delta;
 } DrawState;
 
 static DrawState g_draw;
@@ -82,6 +85,68 @@ static int *g_palette_map;
 static int g_palette_map_size;
 static int g_palette_map_used;
 static SpriteEntry g_sprites[SPRITE_MAX];
+
+typedef struct {
+    int down[SDL_NUM_SCANCODES];
+    int pressed[SDL_NUM_SCANCODES];
+    int last_key;
+    int mouse_down[3];
+    int mouse_pressed[3];
+    int mouse_button;
+    int mouse_x;
+    int mouse_y;
+    int mouse_dx;
+    int mouse_dy;
+    int frame_mouse_dx;
+    int frame_mouse_dy;
+    int wheel_dx;
+    int wheel_dy;
+    int frame_wheel_dx;
+    int frame_wheel_dy;
+} InputState;
+
+typedef struct {
+    const char *name;
+    SDL_Scancode code;
+} KeyName;
+
+static InputState g_input;
+
+static const KeyName g_key_names[] = {
+    {"a", SDL_SCANCODE_A}, {"b", SDL_SCANCODE_B}, {"c", SDL_SCANCODE_C},
+    {"d", SDL_SCANCODE_D}, {"e", SDL_SCANCODE_E}, {"f", SDL_SCANCODE_F},
+    {"g", SDL_SCANCODE_G}, {"h", SDL_SCANCODE_H}, {"i", SDL_SCANCODE_I},
+    {"j", SDL_SCANCODE_J}, {"k", SDL_SCANCODE_K}, {"l", SDL_SCANCODE_L},
+    {"m", SDL_SCANCODE_M}, {"n", SDL_SCANCODE_N}, {"o", SDL_SCANCODE_O},
+    {"p", SDL_SCANCODE_P}, {"q", SDL_SCANCODE_Q}, {"r", SDL_SCANCODE_R},
+    {"s", SDL_SCANCODE_S}, {"t", SDL_SCANCODE_T}, {"u", SDL_SCANCODE_U},
+    {"v", SDL_SCANCODE_V}, {"w", SDL_SCANCODE_W}, {"x", SDL_SCANCODE_X},
+    {"y", SDL_SCANCODE_Y}, {"z", SDL_SCANCODE_Z},
+    {"0", SDL_SCANCODE_0}, {"1", SDL_SCANCODE_1}, {"2", SDL_SCANCODE_2},
+    {"3", SDL_SCANCODE_3}, {"4", SDL_SCANCODE_4}, {"5", SDL_SCANCODE_5},
+    {"6", SDL_SCANCODE_6}, {"7", SDL_SCANCODE_7}, {"8", SDL_SCANCODE_8},
+    {"9", SDL_SCANCODE_9},
+    {"left", SDL_SCANCODE_LEFT}, {"right", SDL_SCANCODE_RIGHT},
+    {"up", SDL_SCANCODE_UP}, {"down", SDL_SCANCODE_DOWN},
+    {"space", SDL_SCANCODE_SPACE}, {"enter", SDL_SCANCODE_RETURN},
+    {"escape", SDL_SCANCODE_ESCAPE}, {"esc", SDL_SCANCODE_ESCAPE},
+    {"tab", SDL_SCANCODE_TAB}, {"backspace", SDL_SCANCODE_BACKSPACE},
+    {"delete", SDL_SCANCODE_DELETE},
+    {"shift", SDL_SCANCODE_LSHIFT}, {"rshift", SDL_SCANCODE_RSHIFT},
+    {"ctrl", SDL_SCANCODE_LCTRL}, {"rctrl", SDL_SCANCODE_RCTRL},
+    {"alt", SDL_SCANCODE_LALT}, {"ralt", SDL_SCANCODE_RALT},
+    {"f1", SDL_SCANCODE_F1}, {"f2", SDL_SCANCODE_F2},
+    {"f3", SDL_SCANCODE_F3}, {"f4", SDL_SCANCODE_F4},
+    {"f5", SDL_SCANCODE_F5}, {"f6", SDL_SCANCODE_F6},
+    {"f7", SDL_SCANCODE_F7}, {"f8", SDL_SCANCODE_F8},
+    {"f9", SDL_SCANCODE_F9}, {"f10", SDL_SCANCODE_F10},
+    {"f11", SDL_SCANCODE_F11}, {"f12", SDL_SCANCODE_F12}
+};
+
+static const size_t g_key_name_count =
+    sizeof(g_key_names) / sizeof(g_key_names[0]);
+
+static const char *g_mouse_button_names[3] = {"left", "middle", "right"};
 
 /*
  * 8x8 monochrome bitmap font for ASCII 0..127.
@@ -686,6 +751,15 @@ static int parse_angle(lua_State *L, int index)
     return (int)angle;
 }
 
+static int parse_flip(lua_State *L, int index, const char *option)
+{
+    if (lua_isnoneornil(L, index))
+        return 0;
+    if (!lua_isboolean(L, index))
+        return luaL_error(L, "draw.draw: %s must be true or false", option);
+    return lua_toboolean(L, index);
+}
+
 static int visible_range(double start, double size, int screen_size,
                          int *out_start, int *out_end)
 {
@@ -1057,6 +1131,86 @@ static void fill_triangle(long long x1, long long y1,
     }
 }
 
+static void draw_line(long long x1, long long y1,
+                      long long x2, long long y2,
+                      int width, uint32_t color)
+{
+    typedef __int128 line_i128;
+
+    long long dx = x2 - x1;
+    long long dy = y2 - y1;
+    long long len2 = dx * dx + dy * dy;
+    long long len = isqrt_ll(len2);
+    long long radius = width / 2 + 1;
+    line_i128 cross_limit = (line_i128)width * len;
+    line_i128 dot_limit = (line_i128)len2;
+    line_i128 end_limit = (line_i128)width * width;
+
+    if (len2 == 0) {
+        fill_rect(x1 - width / 2, y1 - width / 2,
+                  width, width, 0, color);
+        return;
+    }
+
+    long long minx, maxx, miny, maxy;
+    long long x, y;
+
+    minx = x1 < x2 ? x1 : x2;
+    maxx = x1 > x2 ? x1 : x2;
+    miny = y1 < y2 ? y1 : y2;
+    maxy = y1 > y2 ? y1 : y2;
+
+    minx -= radius;
+    maxx += radius;
+    miny -= radius;
+    maxy += radius;
+
+    if (minx < 0)
+        minx = 0;
+    if (miny < 0)
+        miny = 0;
+    if (maxx >= g_draw.width)
+        maxx = (long long)g_draw.width - 1;
+    if (maxy >= g_draw.height)
+        maxy = (long long)g_draw.height - 1;
+    if (minx > maxx || miny > maxy)
+        return;
+
+    for (y = miny; y <= maxy; ++y) {
+        long long start = -1;
+
+        for (x = minx; x <= maxx; ++x) {
+            line_i128 vx = (line_i128)x - x1;
+            line_i128 vy = (line_i128)y - y1;
+            line_i128 wx = (line_i128)x - x2;
+            line_i128 wy = (line_i128)y - y2;
+            line_i128 cross = (line_i128)dx * vy - (line_i128)dy * vx;
+            line_i128 dot = (line_i128)dx * vx + (line_i128)dy * vy;
+            line_i128 dist_a = vx * vx + vy * vy;
+            line_i128 dist_b = wx * wx + wy * wy;
+            int hit;
+
+            if (cross < 0)
+                cross = -cross;
+
+            hit = (dot >= 0 && dot <= dot_limit &&
+                   2 * cross <= cross_limit) ||
+                  4 * dist_a <= end_limit ||
+                  4 * dist_b <= end_limit;
+
+            if (hit) {
+                if (start < 0)
+                    start = x;
+            } else if (start >= 0) {
+                fill_span(start, x - 1, y, color);
+                start = -1;
+            }
+        }
+        if (start >= 0)
+            fill_span(start, maxx, y, color);
+    }
+}
+
 static void present(void)
 {
     if (!g_draw.initialized || !g_draw.open)
@@ -1077,13 +1231,205 @@ static void present(void)
     SDL_RenderPresent(g_draw.renderer);
 }
 
+static void reset_input(void)
+{
+    memset(&g_input, 0, sizeof(g_input));
+    g_input.last_key = -1;
+    g_input.mouse_button = -1;
+}
+
+static SDL_Scancode find_key_code(lua_State *L, int arg)
+{
+    const char *name = luaL_checkstring(L, arg);
+    size_t i;
+
+    for (i = 0; i < g_key_name_count; ++i) {
+        if (strcmp(g_key_names[i].name, name) == 0)
+            return g_key_names[i].code;
+    }
+
+    return (SDL_Scancode)luaL_error(L, "unknown key name '%s'", name);
+}
+
+static const char *key_name_for_code(int code)
+{
+    size_t i;
+
+    for (i = 0; i < g_key_name_count; ++i) {
+        if ((int)g_key_names[i].code == code)
+            return g_key_names[i].name;
+    }
+
+    return NULL;
+}
+
+static int find_mouse_button(lua_State *L, int arg)
+{
+    const char *name = luaL_checkstring(L, arg);
+    int i;
+
+    for (i = 0; i < 3; ++i) {
+        if (strcmp(g_mouse_button_names[i], name) == 0)
+            return i;
+    }
+
+    return (int)luaL_error(L, "unknown mouse button '%s'", name);
+}
+
+static int event_button_index(Uint8 button)
+{
+    if (button == SDL_BUTTON_LEFT)
+        return 0;
+    if (button == SDL_BUTTON_MIDDLE)
+        return 1;
+    if (button == SDL_BUTTON_RIGHT)
+        return 2;
+    return -1;
+}
+
+static void event_position_to_logical(int win_x, int win_y,
+                                      int *out_x, int *out_y)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    float logical_x, logical_y;
+
+    if (g_draw.renderer) {
+        SDL_RenderWindowToLogical(g_draw.renderer, win_x, win_y,
+                                  &logical_x, &logical_y);
+        *out_x = (int)logical_x;
+        *out_y = (int)logical_y;
+        return;
+    }
+#endif
+
+    {
+        int win_w = 1;
+        int win_h = 1;
+
+        SDL_GetWindowSize(g_draw.window, &win_w, &win_h);
+        if (win_w <= 0)
+            win_w = 1;
+        if (win_h <= 0)
+            win_h = 1;
+
+        *out_x = (int)((long long)win_x * g_draw.width / win_w);
+        *out_y = (int)((long long)win_y * g_draw.height / win_h);
+    }
+}
+
+static void event_delta_to_logical(int win_dx, int win_dy,
+                                   int *out_dx, int *out_dy)
+{
+    int win_w = 1;
+    int win_h = 1;
+
+    SDL_GetWindowSize(g_draw.window, &win_w, &win_h);
+    if (win_w <= 0)
+        win_w = 1;
+    if (win_h <= 0)
+        win_h = 1;
+
+    *out_dx = (int)((long long)win_dx * g_draw.width / win_w);
+    *out_dy = (int)((long long)win_dy * g_draw.height / win_h);
+}
+
+static void update_frame_delta(void)
+{
+    Uint64 now = SDL_GetPerformanceCounter();
+    Uint64 freq = SDL_GetPerformanceFrequency();
+
+    if (g_draw.has_prev_frame && freq != 0 && now >= g_draw.prev_frame)
+        g_draw.frame_delta =
+            (double)(now - g_draw.prev_frame) / (double)freq;
+    else
+        g_draw.frame_delta = 0.0;
+
+    g_draw.prev_frame = now;
+    g_draw.has_prev_frame = 1;
+}
+
+static void snapshot_frame_input(void)
+{
+    g_input.frame_mouse_dx = g_input.mouse_dx;
+    g_input.frame_mouse_dy = g_input.mouse_dy;
+    g_input.mouse_dx = 0;
+    g_input.mouse_dy = 0;
+
+    g_input.frame_wheel_dx = g_input.wheel_dx;
+    g_input.frame_wheel_dy = g_input.wheel_dy;
+    g_input.wheel_dx = 0;
+    g_input.wheel_dy = 0;
+}
+
 static void handle_event(const SDL_Event *e)
 {
     if (e->type == SDL_QUIT) {
         g_draw.open = 0;
-    } else if (e->type == SDL_WINDOWEVENT &&
-               e->window.event == SDL_WINDOWEVENT_CLOSE) {
-        g_draw.open = 0;
+        return;
+    }
+
+    if (e->type == SDL_WINDOWEVENT) {
+        if (e->window.event == SDL_WINDOWEVENT_CLOSE)
+            g_draw.open = 0;
+        else if (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+            reset_input();
+        return;
+    }
+
+    if (e->type == SDL_KEYDOWN) {
+        int code = (int)e->key.keysym.scancode;
+
+        if (e->key.repeat)
+            return;
+        if (code >= 0 && code < SDL_NUM_SCANCODES) {
+            g_input.down[code] = 1;
+            g_input.pressed[code] = 1;
+            g_input.last_key = code;
+        }
+        return;
+    }
+
+    if (e->type == SDL_KEYUP) {
+        int code = (int)e->key.keysym.scancode;
+
+        if (code >= 0 && code < SDL_NUM_SCANCODES)
+            g_input.down[code] = 0;
+        return;
+    }
+
+    if (e->type == SDL_MOUSEMOTION) {
+        int dx, dy;
+
+        event_position_to_logical(e->motion.x, e->motion.y,
+                                  &g_input.mouse_x, &g_input.mouse_y);
+        event_delta_to_logical(e->motion.xrel, e->motion.yrel, &dx, &dy);
+        g_input.mouse_dx += dx;
+        g_input.mouse_dy += dy;
+        return;
+    }
+
+    if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP) {
+        int index = event_button_index(e->button.button);
+
+        if (e->type == SDL_MOUSEBUTTONDOWN) {
+            event_position_to_logical(e->button.x, e->button.y,
+                                      &g_input.mouse_x, &g_input.mouse_y);
+        }
+        if (index >= 0) {
+            if (e->type == SDL_MOUSEBUTTONDOWN) {
+                g_input.mouse_down[index] = 1;
+                g_input.mouse_pressed[index] = 1;
+                g_input.mouse_button = index;
+            } else {
+                g_input.mouse_down[index] = 0;
+            }
+        }
+        return;
+    }
+
+    if (e->type == SDL_MOUSEWHEEL) {
+        g_input.wheel_dx += e->wheel.x;
+        g_input.wheel_dy += e->wheel.y;
     }
 }
 
@@ -1173,6 +1519,8 @@ static int l_pres(lua_State *L)
         return 1;
     }
 
+    update_frame_delta();
+
     pump_events();
     if (!g_draw.open) {
         lua_pushboolean(L, 0);
@@ -1186,6 +1534,7 @@ static int l_pres(lua_State *L)
         return 1;
     }
 
+    snapshot_frame_input();
     present();
     lua_pushboolean(L, 1);
     return 1;
@@ -1259,6 +1608,9 @@ static void destroy_resources(void)
     g_draw.fps = 60;
     g_draw.vsync = 0;
     g_draw.last_tick = 0;
+    g_draw.prev_frame = 0;
+    g_draw.has_prev_frame = 0;
+    g_draw.frame_delta = 0.0;
 
     if (g_draw.sdl_owned) {
         SDL_Quit();
@@ -1285,6 +1637,7 @@ static int l_open(lua_State *L)
         return luaL_error(L, "draw.open: dimensions are too large");
 
     destroy_resources();
+    reset_input();
 
     if (SDL_WasInit(SDL_INIT_VIDEO) == 0) {
         SDL_SetMainReady();
@@ -1358,6 +1711,9 @@ static int l_open(lua_State *L)
     g_draw.has_dirty = 0;
 
     g_draw.last_tick = SDL_GetPerformanceCounter();
+    g_draw.prev_frame = g_draw.last_tick;
+    g_draw.has_prev_frame = 0;
+    g_draw.frame_delta = 0.0;
     freq = SDL_GetPerformanceFrequency();
     if (!g_draw.vsync && freq != 0) {
         target = freq / (Uint64)g_draw.fps;
@@ -1603,6 +1959,8 @@ static int l_draw_sprite(lua_State *L)
     const char *name;
     int scale;
     int angle;
+    int flipx;
+    int flipy;
     int step;
     int index;
     int sx, sy;
@@ -1627,6 +1985,8 @@ static int l_draw_sprite(lua_State *L)
     name = luaL_checkstring(L, 3);
     scale = parse_scale(L, 4);
     angle = parse_angle(L, 5);
+    flipx = parse_flip(L, 6, "flipx");
+    flipy = parse_flip(L, 7, "flipy");
 
     index = find_sprite_name(name);
     if (index < 0)
@@ -1690,6 +2050,10 @@ static int l_draw_sprite(lua_State *L)
 
             col = (int)floor(p / scale + 1e-9);
             row = (int)floor(q / scale + 1e-9);
+            if (flipx)
+                col = sprite->width - 1 - col;
+            if (flipy)
+                row = sprite->height - 1 - row;
             if (col < 0 || col >= sprite->width ||
                 row < 0 || row >= sprite->height)
                 continue;
@@ -1748,6 +2112,195 @@ static int l_pixel(lua_State *L)
         return luaL_error(L, "draw.pixel: expected a color");
 
     put_pixel((long long)x, (long long)y, make_color(r, g, b));
+    return 0;
+}
+
+static int l_getpixel(lua_State *L)
+{
+    long long x, y;
+    uint32_t color;
+
+    if (!g_draw.initialized || !g_draw.open) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    x = luaL_checkinteger(L, 1);
+    y = luaL_checkinteger(L, 2);
+    if (x < 0 || y < 0 || x >= g_draw.width || y >= g_draw.height) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    color = g_draw.pixels[(size_t)y * (size_t)g_draw.width + (size_t)x];
+    lua_pushinteger(L, (int)((color >> 16) & 0xFF));
+    lua_pushinteger(L, (int)((color >> 8) & 0xFF));
+    lua_pushinteger(L, (int)(color & 0xFF));
+    return 3;
+}
+
+static int l_width(lua_State *L)
+{
+    lua_pushinteger(L, g_draw.width);
+    return 1;
+}
+
+static int l_height(lua_State *L)
+{
+    lua_pushinteger(L, g_draw.height);
+    return 1;
+}
+
+static int l_title(lua_State *L)
+{
+    const char *title;
+
+    if (lua_isnoneornil(L, 1)) {
+        if (g_draw.window)
+            lua_pushstring(L, SDL_GetWindowTitle(g_draw.window));
+        else
+            lua_pushnil(L);
+        return 1;
+    }
+
+    title = luaL_checkstring(L, 1);
+    if (g_draw.window)
+        SDL_SetWindowTitle(g_draw.window, title);
+    return 0;
+}
+
+static int l_delta(lua_State *L)
+{
+    lua_pushnumber(L, (lua_Number)g_draw.frame_delta);
+    return 1;
+}
+
+static int l_mouse(lua_State *L)
+{
+    lua_pushinteger(L, g_input.frame_mouse_dx);
+    lua_pushinteger(L, g_input.frame_mouse_dy);
+    return 2;
+}
+
+static int l_xymouse(lua_State *L)
+{
+    const char *axis;
+
+    if (lua_isnoneornil(L, 1)) {
+        lua_pushinteger(L, g_input.mouse_x);
+        lua_pushinteger(L, g_input.mouse_y);
+        return 2;
+    }
+
+    axis = luaL_checkstring(L, 1);
+    if (strcmp(axis, "x") == 0) {
+        lua_pushinteger(L, g_input.mouse_x);
+        return 1;
+    }
+    if (strcmp(axis, "y") == 0) {
+        lua_pushinteger(L, g_input.mouse_y);
+        return 1;
+    }
+
+    return luaL_error(L, "draw.xymouse: expected 'x' or 'y'");
+}
+
+static int l_mousekey(lua_State *L)
+{
+    if (g_input.mouse_button < 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_pushstring(L, g_mouse_button_names[g_input.mouse_button]);
+    return 1;
+}
+
+static int l_keys(lua_State *L)
+{
+    const char *name = key_name_for_code(g_input.last_key);
+
+    if (name == NULL) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_pushstring(L, name);
+    return 1;
+}
+
+static int l_key(lua_State *L)
+{
+    SDL_Scancode code = find_key_code(L, 1);
+
+    lua_pushboolean(L, (int)code >= 0 && (int)code < SDL_NUM_SCANCODES &&
+                        g_input.down[(int)code]);
+    return 1;
+}
+
+static int l_keypres(lua_State *L)
+{
+    SDL_Scancode code = find_key_code(L, 1);
+
+    if ((int)code >= 0 && (int)code < SDL_NUM_SCANCODES &&
+        g_input.pressed[(int)code]) {
+        g_input.pressed[(int)code] = 0;
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
+static int l_mousepres(lua_State *L)
+{
+    int index = find_mouse_button(L, 1);
+
+    if (g_input.mouse_pressed[index]) {
+        g_input.mouse_pressed[index] = 0;
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
+static int l_wheel(lua_State *L)
+{
+    lua_pushinteger(L, g_input.frame_wheel_dx);
+    lua_pushinteger(L, g_input.frame_wheel_dy);
+    return 2;
+}
+
+static int l_line(lua_State *L)
+{
+    lua_Integer x1, y1, x2, y2;
+    int r, g, b;
+    int fill;
+    int width;
+
+    if (!ensure_open(L, "draw.line"))
+        return 0;
+
+    x1 = luaL_checkinteger(L, 1);
+    y1 = luaL_checkinteger(L, 2);
+    x2 = luaL_checkinteger(L, 3);
+    y2 = luaL_checkinteger(L, 4);
+
+    if (x1 < -1000000000LL || x1 > 1000000000LL ||
+        y1 < -1000000000LL || y1 > 1000000000LL ||
+        x2 < -1000000000LL || x2 > 1000000000LL ||
+        y2 < -1000000000LL || y2 > 1000000000LL)
+        return luaL_error(L, "draw.line: coordinates are too large");
+
+    if (read_color(L, 5, &r, &g, &b) < 0)
+        return luaL_error(L, "draw.line: expected a color");
+    fill = read_fill(L, 5, "draw.line");
+    width = fill <= 0 ? 1 : fill;
+
+    draw_line((long long)x1, (long long)y1,
+              (long long)x2, (long long)y2,
+              width, make_color(r, g, b));
     return 0;
 }
 
@@ -1920,6 +2473,7 @@ static int l_close(lua_State *L)
 {
     (void)L;
     destroy_resources();
+    reset_input();
     return 0;
 }
 
@@ -1947,6 +2501,20 @@ static const luaL_Reg draw_lib[] = {
     {"pres",    l_pres},
     {"clear",   l_clear},
     {"pixel",   l_pixel},
+    {"getpixel", l_getpixel},
+    {"width",   l_width},
+    {"height",  l_height},
+    {"title",   l_title},
+    {"delta",   l_delta},
+    {"mouse",   l_mouse},
+    {"xymouse", l_xymouse},
+    {"mousekey", l_mousekey},
+    {"keys",    l_keys},
+    {"key",     l_key},
+    {"keypres", l_keypres},
+    {"mousepres", l_mousepres},
+    {"wheel",   l_wheel},
+    {"line",    l_line},
     {"circle",  l_circle},
     {"square",  l_square},
     {"triangle", l_triangle},
