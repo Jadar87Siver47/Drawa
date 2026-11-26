@@ -7,31 +7,56 @@
  *
  * Or manually (Lua 5.4, Linux):
  *   gcc -O2 -Wall -Wextra -fPIC -shared -o draw.so draw.c \
- *       $(pkg-config --cflags --libs lua5.4 sdl2) -lm
+ *       $(pkg-config --cflags --libs lua5.4 sdl2 SDL2_image) -lm
  */
 
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 
+#include <SDL_image.h>
+
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
 
+#include <ctype.h>
 #include <limits.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define PALETTE_NAME_MAX 64
-#define PALETTE_INDEX_MAX (INT_MAX - 1)
+#define PALETTE_INDEX_MAX 1023
 #define PALETTE_INITIAL_CAP 64
 #define PALETTE_MAP_INITIAL 128
 #define PALETTE_MAP_EMPTY (-1)
 #define PALETTE_MAP_TOMB (-2)
-#define SPRITE_MAX 128
+#define SPRITE_MAX 1024
 #define SPRITE_NAME_MAX 64
 #define SPRITE_SCALE_MAX 1000000
+#define MELODY_MAX 1024
+#define MELODY_NAME_MAX 64
+#define AUDIO_SAMPLE_RATE 44100
+#define AUDIO_SAMPLE_COUNT 512
+#define AUDIO_VOICES_MAX 8
+#define WAV_MAX_BYTES (64 * 1024 * 1024)
+#define MIDI_MAX_BYTES (16 * 1024 * 1024)
+#define IMAGE_MAX_DIM 4096
+#define IMAGE_MAX_PIXELS (4 * 1024 * 1024)
+#define FONT_MAX 1024
+#define FONT_NAME_MAX 64
+#define FONT_CHARS_MAX 256
+#define AUDIO_WAVE_SINE 0
+#define AUDIO_WAVE_SQUARE 1
+#define AUDIO_WAVE_TRIANGLE 2
+#define AUDIO_WAVE_SAW 3
+#define AUDIO_KIND_MELODY 0
+#define AUDIO_KIND_WAV 1
+#define ANIM_MAX 1024
+#define ANIM_NAME_MAX 64
+#define ANIM_FRAME_MAX 1024
 #define TRIANGLE_COORD_LIMIT 500000000LL
 
 static const double k_diag = 0.70710678118654752440;
@@ -45,7 +70,7 @@ static const double k_sin[8] = {
 typedef struct {
     int used;
     char name[PALETTE_NAME_MAX];
-    int r, g, b;
+    int r, g, b, a;
 } PaletteEntry;
 
 typedef struct {
@@ -55,6 +80,69 @@ typedef struct {
     int height;
     int *pixels;             /* palette indices, -1 = transparent */
 } SpriteEntry;
+
+typedef struct {
+    int rest;
+    double freq;
+    double beats;
+} MelodyNote;
+
+typedef struct {
+    int used;
+    char name[MELODY_NAME_MAX];
+    int kind;
+    int count;
+    MelodyNote *notes;
+    int16_t *samples;
+    int sample_count;
+    int sample_rate;
+} MelodyEntry;
+
+typedef struct {
+    int playing;
+    int kind;
+    MelodyNote *notes;
+    int count;
+    int index;
+    int note_sample;
+    int note_samples;
+    double phase;
+    int16_t *samples;
+    int sample_count;
+    double sample_pos;
+    int sample_rate;
+    int volume;
+    double speed;
+    int wave;
+} AudioVoice;
+
+typedef struct {
+    SDL_AudioDeviceID device;
+    SDL_mutex *mutex;
+    int sample_rate;
+    AudioVoice voices[AUDIO_VOICES_MAX];
+} AudioState;
+
+typedef struct {
+    int used;
+    char name[ANIM_NAME_MAX];
+    int count;
+    char **frames;
+    double fps;
+    Uint32 started;
+} AnimEntry;
+
+typedef struct {
+    int used;
+    char name[FONT_NAME_MAX];
+    int first;
+    int count;
+    int cell_w;
+    int cell_h;
+    int stride;
+    int scale;
+    unsigned char *masks;
+} FontEntry;
 
 typedef struct {
     int width;
@@ -74,6 +162,7 @@ typedef struct {
     Uint64 prev_frame;
     int has_prev_frame;
     double frame_delta;
+    int alpha;
 } DrawState;
 
 static DrawState g_draw;
@@ -85,6 +174,12 @@ static int *g_palette_map;
 static int g_palette_map_size;
 static int g_palette_map_used;
 static SpriteEntry g_sprites[SPRITE_MAX];
+static AnimEntry g_anims[ANIM_MAX];
+static FontEntry g_fonts[FONT_MAX];
+static MelodyEntry g_melodies[MELODY_MAX];
+static AudioState g_audio;
+
+static void audio_update_finished(void);
 
 typedef struct {
     int down[SDL_NUM_SCANCODES];
@@ -526,7 +621,7 @@ static int find_free_palette(void)
         }
     }
 
-    if (g_palette_count >= PALETTE_INDEX_MAX)
+    if (g_palette_count >= PALETTE_INDEX_MAX + 1)
         return -1;
     if (palette_grow(g_palette_count + 1) != 0)
         return -1;
@@ -534,6 +629,43 @@ static int find_free_palette(void)
     i = g_palette_count++;
     g_palette_free_hint = 0;
     return i;
+}
+
+static int auto_palette_add(const char *prefix, int n, int r, int g, int b,
+                            int a)
+{
+    char name[PALETTE_NAME_MAX];
+    size_t len;
+    int suffix;
+    int index;
+    int written;
+
+    written = snprintf(name, sizeof(name), "%s_c%d", prefix, n);
+    if (written < 0 || (size_t)written >= sizeof(name))
+        return -1;
+    for (suffix = 2; find_palette_name(name) >= 0; ++suffix) {
+        written = snprintf(name, sizeof(name), "%s_c%d_%d", prefix, n,
+                           suffix);
+        if (written < 0 || (size_t)written >= sizeof(name) || suffix > 10000)
+            return -1;
+    }
+
+    index = find_free_palette();
+    if (index < 0)
+        return -1;
+    len = strlen(name);
+    memcpy(g_palette[index].name, name, len + 1);
+    g_palette[index].used = 1;
+    if (palette_map_set_name(name, index) != 0) {
+        g_palette[index].used = 0;
+        g_palette[index].name[0] = '\0';
+        return -1;
+    }
+    g_palette[index].r = clamp_color(r);
+    g_palette[index].g = clamp_color(g);
+    g_palette[index].b = clamp_color(b);
+    g_palette[index].a = clamp_color(a);
+    return index;
 }
 
 static void free_palette(void)
@@ -550,10 +682,11 @@ static void free_palette(void)
     g_palette_map_used = 0;
 }
 
-static int read_color(lua_State *L, int first, int *r, int *g, int *b)
+static int read_color(lua_State *L, int first, int *r, int *g, int *b, int *a)
 {
     int top = lua_gettop(L);
 
+    *a = 255;
     if (top < first)
         return -1;
 
@@ -580,6 +713,7 @@ static int read_color(lua_State *L, int first, int *r, int *g, int *b)
         *r = g_palette[index].r;
         *g = g_palette[index].g;
         *b = g_palette[index].b;
+        *a = g_palette[index].a;
         return 0;
     }
 
@@ -597,6 +731,7 @@ static int read_color(lua_State *L, int first, int *r, int *g, int *b)
         *r = g_palette[index].r;
         *g = g_palette[index].g;
         *b = g_palette[index].b;
+        *a = g_palette[index].a;
         return 0;
     }
 
@@ -625,12 +760,50 @@ static int read_fill(lua_State *L, int color_first, const char *name)
     return (int)value;
 }
 
-static uint32_t make_color(int r, int g, int b)
+static uint32_t make_color(int r, int g, int b, int a)
 {
-    return 0xFF000000u |
+    int alpha = (clamp_color(a) * g_draw.alpha) / 255;
+
+    return ((uint32_t)alpha << 24) |
            ((uint32_t)r << 16) |
            ((uint32_t)g << 8) |
            (uint32_t)b;
+}
+
+static uint32_t blend_color(uint32_t dst, uint32_t src)
+{
+    unsigned sa = (src >> 24) & 0xFF;
+    unsigned da;
+    unsigned out_a;
+    unsigned out_r, out_g, out_b;
+
+    if (sa == 255)
+        return src;
+    if (sa == 0)
+        return dst;
+
+    da = (dst >> 24) & 0xFF;
+    if (da == 0)
+        return src;
+
+    out_a = sa + (da * (255u - sa)) / 255u;
+    if (out_a == 0)
+        return 0;
+
+    out_r = (((src >> 16) & 0xFF) * sa +
+             (((dst >> 16) & 0xFF) * da * (255u - sa)) / 255u +
+             out_a / 2u) / out_a;
+    out_g = (((src >> 8) & 0xFF) * sa +
+             (((dst >> 8) & 0xFF) * da * (255u - sa)) / 255u +
+             out_a / 2u) / out_a;
+    out_b = ((src & 0xFF) * sa +
+             ((dst & 0xFF) * da * (255u - sa)) / 255u +
+             out_a / 2u) / out_a;
+
+    return (out_a << 24) |
+           ((out_r & 0xFF) << 16) |
+           ((out_g & 0xFF) << 8) |
+           (out_b & 0xFF);
 }
 
 static int find_sprite_name(const char *name)
@@ -656,6 +829,86 @@ static int first_free_sprite(void)
     }
 
     return -1;
+}
+
+static int find_anim_name(const char *name)
+{
+    int i;
+
+    for (i = 0; i < ANIM_MAX; ++i) {
+        if (g_anims[i].used && strcmp(g_anims[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int first_free_anim(void)
+{
+    int i;
+
+    for (i = 0; i < ANIM_MAX; ++i) {
+        if (!g_anims[i].used)
+            return i;
+    }
+    return -1;
+}
+
+static void free_anim(AnimEntry *anim)
+{
+    int i;
+
+    for (i = 0; i < anim->count; ++i)
+        free(anim->frames[i]);
+    free(anim->frames);
+    anim->frames = NULL;
+    anim->count = 0;
+}
+
+static void free_anims(void)
+{
+    int i;
+
+    for (i = 0; i < ANIM_MAX; ++i) {
+        free_anim(&g_anims[i]);
+        g_anims[i].used = 0;
+        g_anims[i].name[0] = '\0';
+    }
+}
+
+static int find_font_name(const char *name)
+{
+    int i;
+
+    for (i = 0; i < FONT_MAX; ++i) {
+        if (g_fonts[i].used && strcmp(g_fonts[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int first_free_font(void)
+{
+    int i;
+
+    for (i = 0; i < FONT_MAX; ++i) {
+        if (!g_fonts[i].used)
+            return i;
+    }
+    return -1;
+}
+
+static void free_font(FontEntry *font)
+{
+    free(font->masks);
+    memset(font, 0, sizeof(*font));
+}
+
+static void free_fonts(void)
+{
+    int i;
+
+    for (i = 0; i < FONT_MAX; ++i)
+        free_font(&g_fonts[i]);
 }
 
 static int parse_sprite_string(const char *s, int **out, int *out_len)
@@ -702,6 +955,148 @@ static int parse_sprite_string(const char *s, int **out, int *out_len)
     *out = values;
     *out_len = len;
     return 0;
+}
+
+static int find_melody_name(const char *name)
+{
+    int i;
+
+    for (i = 0; i < MELODY_MAX; ++i) {
+        if (g_melodies[i].used &&
+            strcmp(g_melodies[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int first_free_melody(void)
+{
+    int i;
+
+    for (i = 0; i < MELODY_MAX; ++i) {
+        if (!g_melodies[i].used)
+            return i;
+    }
+    return -1;
+}
+
+static void free_melody(MelodyEntry *melody)
+{
+    free(melody->notes);
+    free(melody->samples);
+    melody->notes = NULL;
+    melody->samples = NULL;
+    melody->count = 0;
+    melody->sample_count = 0;
+    melody->sample_rate = 0;
+    melody->kind = AUDIO_KIND_MELODY;
+}
+
+static void free_melodies(void)
+{
+    int i;
+
+    for (i = 0; i < MELODY_MAX; ++i) {
+        free_melody(&g_melodies[i]);
+        g_melodies[i].used = 0;
+        g_melodies[i].name[0] = '\0';
+    }
+}
+
+static double note_name_to_freq(const char *s)
+{
+    static const int semitones[7] = {0, 2, 4, 5, 7, 9, 11};
+    const char *p = s;
+    char letter;
+    int semi;
+    int octave = 4;
+    int midi;
+
+    if (!s || !*s)
+        return -1.0;
+
+    letter = (char)tolower((unsigned char)*p++);
+    if (letter < 'a' || letter > 'g')
+        return -1.0;
+    semi = semitones[letter - 'a'];
+
+    if (*p == '#' || *p == 'b') {
+        if (*p == '#')
+            semi += 1;
+        else
+            semi -= 1;
+        ++p;
+    }
+
+    if (*p) {
+        char *end;
+        long raw = strtol(p, &end, 10);
+
+        if (end == p || *end != '\0' || raw < 0 || raw > 8)
+            return -1.0;
+        octave = (int)raw;
+    }
+
+    midi = (octave + 1) * 12 + semi;
+    return 440.0 * pow(2.0, (midi - 69) / 12.0);
+}
+
+static int parse_note_scalar(lua_State *L, int index, MelodyNote *note)
+{
+    const char *s;
+    double n;
+    double freq;
+
+    note->rest = 0;
+    note->freq = 0.0;
+    note->beats = 1.0;
+
+    if (lua_isnil(L, index))
+        return -1;
+
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        n = luaL_checknumber(L, index);
+        if (n == 0.0) {
+            note->rest = 1;
+            return 0;
+        }
+        if (n < 0.0 || n > 20000.0)
+            return -1;
+        note->freq = n;
+        return 0;
+    }
+
+    if (lua_type(L, index) == LUA_TSTRING) {
+        s = lua_tostring(L, index);
+        if (strcmp(s, "-") == 0 || strcmp(s, "r") == 0 ||
+            strcmp(s, "R") == 0 || strcmp(s, "rest") == 0 ||
+            strcmp(s, "REST") == 0) {
+            note->rest = 1;
+            return 0;
+        }
+        freq = note_name_to_freq(s);
+        if (freq < 0.0)
+            return -1;
+        note->freq = freq;
+        return 0;
+    }
+
+    return -1;
+}
+
+static double parse_beats(lua_State *L, int index)
+{
+    double n;
+
+    if (lua_isnoneornil(L, index))
+        return 1.0;
+    if (lua_type(L, index) != LUA_TNUMBER)
+        return -1.0;
+
+    n = luaL_checknumber(L, index);
+    if (n <= 0.0 || n > 64.0)
+        return -1.0;
+    return n;
 }
 
 static int parse_scale(lua_State *L, int index)
@@ -758,6 +1153,78 @@ static int parse_flip(lua_State *L, int index, const char *option)
     if (!lua_isboolean(L, index))
         return luaL_error(L, "draw.draw: %s must be true or false", option);
     return lua_toboolean(L, index);
+}
+
+static int parse_tint(lua_State *L, int index, int *r, int *g, int *b, int *a)
+{
+    lua_Integer raw;
+    int i;
+    int values[4];
+    const char *name;
+
+    *r = 255;
+    *g = 255;
+    *b = 255;
+    *a = 255;
+
+    if (lua_isnoneornil(L, index))
+        return 0;
+
+    if (lua_istable(L, index)) {
+        for (i = 0; i < 3; ++i) {
+            lua_pushinteger(L, i + 1);
+            lua_rawget(L, index);
+            if (!lua_isnumber(L, -1))
+                return luaL_error(L, "draw.draw: tint must be {r, g, b, [a]}");
+            values[i] = clamp_color((int)luaL_checkinteger(L, -1));
+            lua_pop(L, 1);
+        }
+        lua_pushinteger(L, 4);
+        lua_rawget(L, index);
+        if (lua_isnil(L, -1))
+            values[3] = 255;
+        else if (lua_isnumber(L, -1))
+            values[3] = clamp_color((int)luaL_checkinteger(L, -1));
+        else
+            return luaL_error(L, "draw.draw: tint must be {r, g, b, [a]}");
+        lua_pop(L, 1);
+        *r = values[0];
+        *g = values[1];
+        *b = values[2];
+        *a = values[3];
+        return 0;
+    }
+
+    if (lua_type(L, index) == LUA_TSTRING) {
+        name = lua_tostring(L, index);
+        i = find_palette_name(name);
+        if (i < 0)
+            return luaL_error(L,
+                "draw.draw: tint palette color '%s' is not defined", name);
+        *r = g_palette[i].r;
+        *g = g_palette[i].g;
+        *b = g_palette[i].b;
+        *a = g_palette[i].a;
+        return 0;
+    }
+
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        raw = luaL_checkinteger(L, index);
+        if (raw < 0 || raw > PALETTE_INDEX_MAX)
+            return luaL_error(L, "draw.draw: tint palette index is out of range");
+        i = (int)raw;
+        if (i >= g_palette_count || !g_palette[i].used)
+            return luaL_error(L,
+                "draw.draw: tint palette index %d is not defined", i);
+        *r = g_palette[i].r;
+        *g = g_palette[i].g;
+        *b = g_palette[i].b;
+        *a = g_palette[i].a;
+        return 0;
+    }
+
+    return luaL_error(L,
+        "draw.draw: tint must be a palette name/index or {r, g, b, [a]}");
 }
 
 static int visible_range(double start, double size, int screen_size,
@@ -881,7 +1348,7 @@ static void fill_span(long long x0, long long x1, long long y, uint32_t color)
 
     row = g_draw.pixels + (size_t)yi * (size_t)g_draw.width;
     for (x = xi0; x <= xi1; ++x)
-        row[x] = color;
+        row[x] = blend_color(row[x], color);
 
     mark_dirty_rect(xi0, yi, xi1 - xi0 + 1, 1);
 }
@@ -1520,6 +1987,7 @@ static int l_pres(lua_State *L)
     }
 
     update_frame_delta();
+    audio_update_finished();
 
     pump_events();
     if (!g_draw.open) {
@@ -1546,7 +2014,9 @@ static void put_pixel(long long x, long long y, uint32_t color)
         y < 0 || y >= (long long)g_draw.height)
         return;
 
-    g_draw.pixels[(size_t)y * (size_t)g_draw.width + (size_t)x] = color;
+    g_draw.pixels[(size_t)y * (size_t)g_draw.width + (size_t)x] =
+        blend_color(g_draw.pixels[(size_t)y * (size_t)g_draw.width + (size_t)x],
+                    color);
     mark_dirty((int)x, (int)y);
 }
 
@@ -1583,6 +2053,784 @@ static int glyph_pixel(const unsigned char *glyph, int dx, int dy, int size)
     }
 }
 
+static void audio_clear_voice(AudioVoice *voice)
+{
+    free(voice->notes);
+    free(voice->samples);
+    memset(voice, 0, sizeof(*voice));
+}
+
+static void audio_stop(void)
+{
+    int i;
+
+    if (g_audio.device)
+        SDL_PauseAudioDevice(g_audio.device, 1);
+
+    if (g_audio.mutex) {
+        SDL_LockMutex(g_audio.mutex);
+        for (i = 0; i < AUDIO_VOICES_MAX; ++i)
+            audio_clear_voice(&g_audio.voices[i]);
+        SDL_UnlockMutex(g_audio.mutex);
+    }
+}
+
+static void audio_close(void)
+{
+    audio_stop();
+
+    if (g_audio.device) {
+        SDL_CloseAudioDevice(g_audio.device);
+        g_audio.device = 0;
+    }
+    if (g_audio.mutex) {
+        SDL_DestroyMutex(g_audio.mutex);
+        g_audio.mutex = NULL;
+    }
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}
+
+static int note_sample_count(const MelodyNote *note, double speed, int rate)
+{
+    double samples = note->beats / speed * (double)rate;
+
+    if (samples < 1.0)
+        samples = 1.0;
+    if (samples > 2147483647.0)
+        samples = 2147483647.0;
+    return (int)samples;
+}
+
+static void audio_set_note(AudioVoice *voice, int index, int rate)
+{
+    voice->index = index;
+    voice->note_sample = 0;
+    voice->phase = 0.0;
+
+    if (index >= voice->count) {
+        voice->note_samples = 0;
+        return;
+    }
+    voice->note_samples =
+        note_sample_count(&voice->notes[index], voice->speed, rate);
+}
+
+static double wave_sample(int wave, double phase)
+{
+    if (wave == AUDIO_WAVE_SQUARE)
+        return phase < 0.5 ? 1.0 : -1.0;
+    if (wave == AUDIO_WAVE_TRIANGLE)
+        return 4.0 * fabs(phase - floor(phase + 0.5)) - 1.0;
+    if (wave == AUDIO_WAVE_SAW)
+        return 2.0 * phase - 1.0;
+    return sin(2.0 * 3.14159265358979323846 * phase);
+}
+
+static int parse_wave(lua_State *L, int index)
+{
+    const char *s;
+    lua_Integer n;
+
+    if (lua_isnoneornil(L, index))
+        return AUDIO_WAVE_SINE;
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        n = luaL_checkinteger(L, index);
+        if (n < AUDIO_WAVE_SINE || n > AUDIO_WAVE_SAW)
+            return -1;
+        return (int)n;
+    }
+    if (lua_type(L, index) != LUA_TSTRING)
+        return -1;
+    s = lua_tostring(L, index);
+    if (strcmp(s, "sine") == 0)
+        return AUDIO_WAVE_SINE;
+    if (strcmp(s, "square") == 0 || strcmp(s, "sqr") == 0)
+        return AUDIO_WAVE_SQUARE;
+    if (strcmp(s, "triangle") == 0 || strcmp(s, "tri") == 0)
+        return AUDIO_WAVE_TRIANGLE;
+    if (strcmp(s, "saw") == 0 || strcmp(s, "sawtooth") == 0)
+        return AUDIO_WAVE_SAW;
+    return -1;
+}
+
+static uint16_t read_le16(const unsigned char *p)
+{
+    return (uint16_t)((unsigned)p[0] | ((unsigned)p[1] << 8));
+}
+
+static uint32_t read_le32(const unsigned char *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int load_wav(const char *path, MelodyEntry *out)
+{
+    FILE *f;
+    unsigned char head[12];
+    unsigned char chunk[8];
+    unsigned char fmt[16];
+    unsigned char *raw = NULL;
+    int16_t *mono = NULL;
+    int have_fmt = 0;
+    int channels = 0;
+    int bits = 0;
+    int rate = 0;
+    uint32_t chunk_size;
+    size_t frames;
+    int frame;
+    int ch;
+    long skip;
+    int rc = -1;
+
+    f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    if (fread(head, 1, sizeof(head), f) != sizeof(head) ||
+        memcmp(head, "RIFF", 4) != 0 || memcmp(head + 8, "WAVE", 4) != 0)
+        goto done;
+
+    while (fread(chunk, 1, sizeof(chunk), f) == sizeof(chunk)) {
+        chunk_size = read_le32(chunk + 4);
+
+        if (memcmp(chunk, "fmt ", 4) == 0) {
+            if (chunk_size < 16 || fread(fmt, 1, 16, f) != 16)
+                goto done;
+            if (read_le16(fmt) != 1)
+                goto done;
+            channels = (int)read_le16(fmt + 2);
+            rate = (int)read_le32(fmt + 4);
+            bits = (int)read_le16(fmt + 14);
+            if (channels < 1 || channels > 2 || rate <= 0 ||
+                (bits != 8 && bits != 16))
+                goto done;
+            have_fmt = 1;
+            skip = (long)(chunk_size - 16) + (long)(chunk_size & 1u);
+            if (fseek(f, skip, SEEK_CUR) != 0)
+                goto done;
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            if (!have_fmt || chunk_size == 0 || chunk_size > WAV_MAX_BYTES)
+                goto done;
+            raw = (unsigned char *)malloc(chunk_size);
+            if (!raw) {
+                rc = -2;
+                goto done;
+            }
+            if (fread(raw, 1, chunk_size, f) != chunk_size)
+                goto done;
+            frames = bits == 16 ? chunk_size / (size_t)(2 * channels)
+                                : chunk_size / (size_t)channels;
+            if (frames == 0)
+                goto done;
+            mono = (int16_t *)malloc(frames * sizeof(int16_t));
+            if (!mono) {
+                rc = -2;
+                goto done;
+            }
+            for (frame = 0; frame < (int)frames; ++frame) {
+                int32_t sum = 0;
+                for (ch = 0; ch < channels; ++ch) {
+                    if (bits == 16) {
+                        size_t pos = ((size_t)frame * channels + ch) * 2;
+                        sum += (int16_t)read_le16(raw + pos);
+                    } else {
+                        size_t pos = (size_t)frame * channels + ch;
+                        sum += ((int)raw[pos] - 128) * 256;
+                    }
+                }
+                mono[frame] = (int16_t)(sum / channels);
+            }
+            out->kind = AUDIO_KIND_WAV;
+            out->notes = NULL;
+            out->count = 0;
+            out->samples = mono;
+            out->sample_count = (int)frames;
+            out->sample_rate = rate;
+            mono = NULL;
+            rc = 0;
+            break;
+        } else {
+            skip = (long)chunk_size + (long)(chunk_size & 1u);
+            if (fseek(f, skip, SEEK_CUR) != 0)
+                goto done;
+        }
+    }
+
+done:
+    free(raw);
+    free(mono);
+    fclose(f);
+    return rc;
+}
+
+typedef struct {
+    long long tick;
+    int off;
+    int note;
+    int velocity;
+    int channel;
+} MidiEvent;
+
+typedef struct {
+    long long start;
+    long long end;
+    int note;
+    int velocity;
+} MidiNote;
+
+static int midi_read_vlq(const unsigned char **p, const unsigned char *end,
+                         unsigned long *out)
+{
+    unsigned long value = 0;
+    int i;
+
+    for (i = 0; i < 4; ++i) {
+        unsigned char byte;
+
+        if (*p >= end)
+            return -1;
+        byte = *(*p)++;
+        value = (value << 7) | (byte & 0x7f);
+        if (!(byte & 0x80)) {
+            *out = value;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static uint16_t midi_be16(const unsigned char *p)
+{
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static uint32_t midi_be32(const unsigned char *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static double midi_freq(int note)
+{
+    return 440.0 * pow(2.0, ((double)note - 69.0) / 12.0);
+}
+
+static int midi_event_cmp(const void *a, const void *b)
+{
+    const MidiEvent *ea = (const MidiEvent *)a;
+    const MidiEvent *eb = (const MidiEvent *)b;
+
+    if (ea->tick != eb->tick)
+        return ea->tick < eb->tick ? -1 : 1;
+    if (ea->off != eb->off)
+        return ea->off < eb->off ? -1 : 1;
+    if (ea->note != eb->note)
+        return ea->note < eb->note ? -1 : 1;
+    return ea->channel - eb->channel;
+}
+
+static int midi_note_cmp(const void *a, const void *b)
+{
+    const MidiNote *na = (const MidiNote *)a;
+    const MidiNote *nb = (const MidiNote *)b;
+
+    if (na->start != nb->start)
+        return na->start < nb->start ? -1 : 1;
+    if (na->note != nb->note)
+        return na->note > nb->note ? -1 : 1;
+    return na->end - nb->end < 0 ? -1 : (na->end != nb->end);
+}
+
+static int midi_append_event(MidiEvent **events, int *count, int *cap,
+                             MidiEvent event)
+{
+    if (*count == *cap) {
+        int new_cap = *cap ? *cap * 2 : 32;
+        MidiEvent *tmp = (MidiEvent *)realloc(*events,
+            (size_t)new_cap * sizeof(MidiEvent));
+
+        if (!tmp)
+            return -2;
+        *events = tmp;
+        *cap = new_cap;
+    }
+    (*events)[(*count)++] = event;
+    return 0;
+}
+
+static int midi_append_note(MidiNote **notes, int *count, int *cap,
+                            MidiNote note)
+{
+    if (*count == *cap) {
+        int new_cap = *cap ? *cap * 2 : 32;
+        MidiNote *tmp = (MidiNote *)realloc(*notes,
+            (size_t)new_cap * sizeof(MidiNote));
+
+        if (!tmp)
+            return -2;
+        *notes = tmp;
+        *cap = new_cap;
+    }
+    (*notes)[(*count)++] = note;
+    return 0;
+}
+
+static int midi_parse_track(const unsigned char *data, size_t size, int ppq,
+                            MidiNote **out_notes, int *out_count,
+                            unsigned long *out_tempo)
+{
+    MidiEvent *events = NULL;
+    MidiNote *notes = NULL;
+    int event_count = 0;
+    int event_cap = 0;
+    int note_count = 0;
+    int note_cap = 0;
+    int open[16][128];
+    const unsigned char *p = data;
+    const unsigned char *end = data + size;
+    unsigned long tick = 0;
+    unsigned long max_tick = 0;
+    int running = 0;
+    int i;
+    int rc = -1;
+
+    for (i = 0; i < 16; ++i) {
+        for (int j = 0; j < 128; ++j)
+            open[i][j] = -1;
+    }
+
+    while (p < end) {
+        unsigned long delta;
+        unsigned long len;
+        int status;
+        int data_len;
+        int d1;
+        int d2;
+        MidiEvent event;
+
+        if (midi_read_vlq(&p, end, &delta) != 0)
+            goto done;
+        tick += delta;
+        if (p >= end)
+            break;
+        if (tick > 0x7fffffffUL)
+            goto done;
+        max_tick = tick;
+
+        status = *p;
+        if (status & 0x80) {
+            running = status;
+            ++p;
+        } else if (running == 0) {
+            goto done;
+        } else {
+            status = running;
+        }
+
+        if (status == 0xff) {
+            unsigned char type;
+
+            if (p >= end)
+                goto done;
+            type = *p++;
+            if (midi_read_vlq(&p, end, &len) != 0 ||
+                (size_t)(end - p) < len)
+                goto done;
+            if (type == 0x2f)
+                break;
+            if (type == 0x51 && len >= 3) {
+                unsigned long tempo = ((unsigned long)p[0] << 16) |
+                                      ((unsigned long)p[1] << 8) |
+                                      (unsigned long)p[2];
+                if (tempo > 0)
+                    *out_tempo = tempo;
+            }
+            p += len;
+            continue;
+        }
+
+        if (status == 0xf0 || status == 0xf7) {
+            if (midi_read_vlq(&p, end, &len) != 0 ||
+                (size_t)(end - p) < len)
+                goto done;
+            p += len;
+            continue;
+        }
+
+        if (status >= 0xf1 && status <= 0xfe)
+            continue;
+        if (status < 0x80 || status > 0xef)
+            goto done;
+
+        data_len = (status >> 4) == 0xc || (status >> 4) == 0xd ? 1 : 2;
+        if ((size_t)(end - p) < (size_t)data_len)
+            goto done;
+        d1 = p[0];
+        d2 = data_len > 1 ? p[1] : 0;
+        p += data_len;
+
+        event.tick = (long long)tick;
+        event.note = d1;
+        event.velocity = d2;
+        event.channel = status & 0x0f;
+        if ((status >> 4) == 0x9 && d2 > 0) {
+            event.off = 0;
+            if (midi_append_event(&events, &event_count, &event_cap,
+                                  event) != 0) {
+                rc = -2;
+                goto done;
+            }
+        } else if ((status >> 4) == 0x8 ||
+                   ((status >> 4) == 0x9 && d2 == 0)) {
+            event.off = 1;
+            if (midi_append_event(&events, &event_count, &event_cap,
+                                  event) != 0) {
+                rc = -2;
+                goto done;
+            }
+        }
+    }
+
+    qsort(events, (size_t)event_count, sizeof(MidiEvent), midi_event_cmp);
+    for (i = 0; i < event_count; ++i) {
+        MidiEvent *event = &events[i];
+
+        if (!event->off) {
+            open[event->channel][event->note] = i;
+            continue;
+        }
+        if (open[event->channel][event->note] >= 0) {
+            MidiEvent *on = &events[open[event->channel][event->note]];
+            MidiNote note;
+
+            if (event->tick > on->tick) {
+                note.start = on->tick;
+                note.end = event->tick;
+                note.note = on->note;
+                note.velocity = on->velocity;
+                if (midi_append_note(&notes, &note_count, &note_cap,
+                                     note) != 0) {
+                    rc = -2;
+                    goto done;
+                }
+            }
+            open[event->channel][event->note] = -1;
+        }
+    }
+
+    for (int ch = 0; ch < 16; ++ch) {
+        for (int note = 0; note < 128; ++note) {
+            if (open[ch][note] >= 0) {
+                MidiEvent *on = &events[open[ch][note]];
+                MidiNote item;
+
+                item.start = on->tick;
+                item.end = (long long)max_tick > item.start
+                               ? (long long)max_tick
+                               : item.start + ppq;
+                item.note = on->note;
+                item.velocity = on->velocity;
+                if (midi_append_note(&notes, &note_count, &note_cap,
+                                     item) != 0) {
+                    rc = -2;
+                    goto done;
+                }
+            }
+        }
+    }
+
+    qsort(notes, (size_t)note_count, sizeof(MidiNote), midi_note_cmp);
+    for (i = 1; i < note_count; ++i) {
+        if (notes[i].start < notes[i - 1].end)
+            notes[i - 1].end = notes[i].start;
+        if (notes[i - 1].end <= notes[i - 1].start)
+            notes[i - 1].end = notes[i - 1].start;
+    }
+
+    *out_notes = notes;
+    *out_count = note_count;
+    notes = NULL;
+    rc = 0;
+
+done:
+    free(events);
+    free(notes);
+    return rc;
+}
+
+static int midi_append_melody_note(MelodyNote **notes, int *count, int *cap,
+                                   MelodyNote note)
+{
+    if (*count == *cap) {
+        int new_cap = *cap ? *cap * 2 : 32;
+        MelodyNote *tmp = (MelodyNote *)realloc(*notes,
+            (size_t)new_cap * sizeof(MelodyNote));
+
+        if (!tmp)
+            return -2;
+        *notes = tmp;
+        *cap = new_cap;
+    }
+    (*notes)[(*count)++] = note;
+    return 0;
+}
+
+static int midi_to_melody(MidiNote *notes, int count, int ppq,
+                          MelodyNote **out_notes, int *out_count)
+{
+    MelodyNote *result = NULL;
+    int result_count = 0;
+    int result_cap = 0;
+    long long cursor = 0;
+    int i;
+
+    qsort(notes, (size_t)count, sizeof(MidiNote), midi_note_cmp);
+    for (i = 0; i < count; ++i) {
+        MelodyNote note;
+
+        if (notes[i].end <= notes[i].start)
+            continue;
+        if (notes[i].start > cursor) {
+            double rest = (double)(notes[i].start - cursor) / (double)ppq;
+
+            while (rest > 64.0) {
+                note.rest = 1;
+                note.freq = 0.0;
+                note.beats = 64.0;
+                if (midi_append_melody_note(&result, &result_count,
+                                            &result_cap, note) != 0)
+                    goto oom;
+                rest -= 64.0;
+            }
+            if (rest > 0.000001) {
+                note.rest = 1;
+                note.freq = 0.0;
+                note.beats = rest;
+                if (midi_append_melody_note(&result, &result_count,
+                                            &result_cap, note) != 0)
+                    goto oom;
+            }
+            cursor = notes[i].start;
+        }
+
+        note.rest = 0;
+        note.freq = midi_freq(notes[i].note);
+        note.beats = (double)(notes[i].end - notes[i].start) / (double)ppq;
+        while (note.beats > 64.0) {
+            MelodyNote part = note;
+
+            part.beats = 64.0;
+            if (midi_append_melody_note(&result, &result_count, &result_cap,
+                                        part) != 0)
+                goto oom;
+            note.beats -= 64.0;
+        }
+        if (note.beats > 0.000001) {
+            if (midi_append_melody_note(&result, &result_count, &result_cap,
+                                        note) != 0)
+                goto oom;
+        }
+        if (notes[i].end > cursor)
+            cursor = notes[i].end;
+    }
+
+    *out_notes = result;
+    *out_count = result_count;
+    return 0;
+
+oom:
+    free(result);
+    return -2;
+}
+
+static int read_file_bytes(const char *path, unsigned char **out,
+                           size_t *out_size)
+{
+    FILE *f;
+    long size;
+    unsigned char *buffer;
+
+    f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    size = ftell(f);
+    if (size < 0 || size > MIDI_MAX_BYTES ||
+        fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    buffer = (unsigned char *)malloc((size_t)size ? (size_t)size : 1);
+    if (!buffer) {
+        fclose(f);
+        return -2;
+    }
+    if (size > 0 && fread(buffer, 1, (size_t)size, f) != (size_t)size) {
+        free(buffer);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    *out = buffer;
+    *out_size = (size_t)size;
+    return 0;
+}
+
+static void audio_callback(void *userdata, Uint8 *stream, int len)
+{
+    int16_t *out = (int16_t *)stream;
+    int samples = len / (int)sizeof(int16_t);
+    int i;
+    int v;
+
+    (void)userdata;
+    SDL_memset(stream, 0, (size_t)len);
+    if (!g_audio.mutex)
+        return;
+
+    SDL_LockMutex(g_audio.mutex);
+    for (i = 0; i < samples; ++i) {
+        double mix = 0.0;
+
+        for (v = 0; v < AUDIO_VOICES_MAX; ++v) {
+            AudioVoice *voice = &g_audio.voices[v];
+            double sample = 0.0;
+
+            if (!voice->playing)
+                continue;
+
+            if (voice->kind == AUDIO_KIND_MELODY) {
+                const MelodyNote *note;
+
+                if (voice->index >= voice->count) {
+                    voice->playing = 0;
+                    continue;
+                }
+                if (voice->note_sample >= voice->note_samples) {
+                    audio_set_note(voice, voice->index + 1,
+                                   g_audio.sample_rate);
+                    if (voice->index >= voice->count) {
+                        voice->playing = 0;
+                        continue;
+                    }
+                }
+                note = &voice->notes[voice->index];
+                if (!note->rest && note->freq > 0.0) {
+                    double attack = 0.005 * (double)g_audio.sample_rate;
+                    double release = 0.010 * (double)g_audio.sample_rate;
+                    double left = (double)(voice->note_samples -
+                                           voice->note_sample);
+                    double envelope = 1.0;
+
+                    if (attack > 0.0 &&
+                        (double)voice->note_sample < attack)
+                        envelope = (double)voice->note_sample / attack;
+                    if (release > 0.0 && left < release)
+                        envelope *= left / release;
+                    if (envelope < 0.0)
+                        envelope = 0.0;
+                    if (envelope > 1.0)
+                        envelope = 1.0;
+
+                    sample = wave_sample(voice->wave, voice->phase) *
+                             envelope;
+                    voice->phase += note->freq /
+                                    (double)g_audio.sample_rate;
+                    if (voice->phase >= 1.0)
+                        voice->phase -= floor(voice->phase);
+                }
+                ++voice->note_sample;
+            } else {
+                double step = voice->speed * (double)voice->sample_rate /
+                              (double)g_audio.sample_rate;
+                int pos;
+                double frac;
+                double a;
+                double b;
+
+                voice->sample_pos += step;
+                if (voice->sample_pos >= (double)voice->sample_count) {
+                    voice->playing = 0;
+                    continue;
+                }
+                pos = (int)voice->sample_pos;
+                frac = voice->sample_pos - (double)pos;
+                a = (double)voice->samples[pos];
+                b = pos + 1 < voice->sample_count
+                        ? (double)voice->samples[pos + 1] : a;
+                sample = (a * (1.0 - frac) + b * frac) / 32768.0;
+            }
+
+            mix += sample * ((double)voice->volume / 255.0);
+        }
+
+        if (mix > 1.0)
+            mix = 1.0;
+        if (mix < -1.0)
+            mix = -1.0;
+        out[i] = (int16_t)(mix * 12000.0);
+    }
+    SDL_UnlockMutex(g_audio.mutex);
+}
+
+static int ensure_audio_device(lua_State *L)
+{
+    SDL_AudioSpec want;
+    SDL_AudioSpec have;
+
+    if (g_audio.device)
+        return 0;
+
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
+        return luaL_error(L, "draw.play: SDL_InitSubSystem failed: %s",
+                          SDL_GetError());
+
+    g_audio.mutex = SDL_CreateMutex();
+    if (!g_audio.mutex)
+        return luaL_error(L, "draw.play: cannot create audio mutex");
+
+    SDL_zero(want);
+    want.freq = AUDIO_SAMPLE_RATE;
+    want.format = AUDIO_S16SYS;
+    want.channels = 1;
+    want.samples = AUDIO_SAMPLE_COUNT;
+    want.callback = audio_callback;
+
+    g_audio.device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (!g_audio.device) {
+        SDL_DestroyMutex(g_audio.mutex);
+        g_audio.mutex = NULL;
+        return luaL_error(L, "draw.play: cannot open audio device: %s",
+                          SDL_GetError());
+    }
+    g_audio.sample_rate = have.freq > 0 ? have.freq : AUDIO_SAMPLE_RATE;
+    return 0;
+}
+
+static void audio_update_finished(void)
+{
+    int playing = 0;
+    int i;
+
+    if (!g_audio.device || !g_audio.mutex)
+        return;
+
+    SDL_LockMutex(g_audio.mutex);
+    for (i = 0; i < AUDIO_VOICES_MAX; ++i) {
+        if (g_audio.voices[i].playing) {
+            playing = 1;
+            break;
+        }
+    }
+    SDL_UnlockMutex(g_audio.mutex);
+
+    if (!playing)
+        SDL_PauseAudioDevice(g_audio.device, 1);
+}
+
 static void destroy_resources(void)
 {
     if (g_draw.texture) {
@@ -1611,6 +2859,9 @@ static void destroy_resources(void)
     g_draw.prev_frame = 0;
     g_draw.has_prev_frame = 0;
     g_draw.frame_delta = 0.0;
+    g_draw.alpha = 255;
+
+    audio_close();
 
     if (g_draw.sdl_owned) {
         SDL_Quit();
@@ -1694,6 +2945,7 @@ static int l_open(lua_State *L)
         return luaL_error(L, "draw.open: cannot create texture: %s",
                           SDL_GetError());
     }
+    SDL_SetTextureBlendMode(g_draw.texture, SDL_BLENDMODE_BLEND);
 
     count = (size_t)w * (size_t)h;
     pixels = (uint32_t *)calloc(count, sizeof(uint32_t));
@@ -1714,6 +2966,7 @@ static int l_open(lua_State *L)
     g_draw.prev_frame = g_draw.last_tick;
     g_draw.has_prev_frame = 0;
     g_draw.frame_delta = 0.0;
+    g_draw.alpha = 255;
     freq = SDL_GetPerformanceFrequency();
     if (!g_draw.vsync && freq != 0) {
         target = freq / (Uint64)g_draw.fps;
@@ -1732,13 +2985,14 @@ static int l_open(lua_State *L)
 static int l_palette(lua_State *L)
 {
     int index;
-    int r, g, b;
+    int r, g, b, a;
     const char *name;
     size_t len;
 
     r = clamp_color(luaL_checkinteger(L, 2));
     g = clamp_color(luaL_checkinteger(L, 3));
     b = clamp_color(luaL_checkinteger(L, 4));
+    a = clamp_color(luaL_optinteger(L, 5, 255));
 
     if (lua_type(L, 1) == LUA_TSTRING) {
         name = luaL_checkstring(L, 1);
@@ -1783,6 +3037,7 @@ static int l_palette(lua_State *L)
     g_palette[index].r = r;
     g_palette[index].g = g;
     g_palette[index].b = b;
+    g_palette[index].a = a;
 
     lua_pushinteger(L, index);
     return 1;
@@ -1953,6 +3208,706 @@ static int l_sprite(lua_State *L)
     return 1;
 }
 
+static int l_anim(lua_State *L)
+{
+    const char *name;
+    size_t name_len;
+    size_t count;
+    size_t i;
+    double fps;
+    char **frames = NULL;
+    int index;
+
+    name = luaL_checkstring(L, 1);
+    name_len = strlen(name);
+    if (name_len == 0)
+        return luaL_error(L, "draw.anim: name must not be empty");
+    if (name_len >= ANIM_NAME_MAX)
+        return luaL_error(L, "draw.anim: name is too long");
+
+    luaL_checktype(L, 2, LUA_TTABLE);
+    count = (size_t)lua_rawlen(L, 2);
+    if (count == 0)
+        return luaL_error(L, "draw.anim: animation is empty");
+    if (count > ANIM_FRAME_MAX)
+        return luaL_error(L, "draw.anim: too many frames (max %d)",
+                          ANIM_FRAME_MAX);
+
+    fps = luaL_optnumber(L, 3, 8.0);
+    if (fps < 0.1 || fps > 1000.0)
+        return luaL_error(L, "draw.anim: fps must be 0.1..1000");
+
+    frames = (char **)calloc(count, sizeof(char *));
+    if (!frames)
+        return luaL_error(L, "draw.anim: out of memory");
+
+    for (i = 0; i < count; ++i) {
+        const char *frame;
+        size_t len;
+
+        lua_rawgeti(L, 2, (int)i + 1);
+        if (lua_type(L, -1) != LUA_TSTRING) {
+            lua_pop(L, 1);
+            for (i = 0; i < count; ++i)
+                free(frames[i]);
+            free(frames);
+            return luaL_error(L, "draw.anim: frame %d must be a string",
+                              (int)i + 1);
+        }
+        frame = lua_tostring(L, -1);
+        len = strlen(frame);
+        if (len == 0 || len >= SPRITE_NAME_MAX) {
+            lua_pop(L, 1);
+            for (i = 0; i < count; ++i)
+                free(frames[i]);
+            free(frames);
+            return luaL_error(L, "draw.anim: invalid sprite name in frame %d",
+                              (int)i + 1);
+        }
+        frames[i] = (char *)malloc(len + 1);
+        if (!frames[i]) {
+            lua_pop(L, 1);
+            for (i = 0; i < count; ++i)
+                free(frames[i]);
+            free(frames);
+            return luaL_error(L, "draw.anim: out of memory");
+        }
+        memcpy(frames[i], frame, len + 1);
+        lua_pop(L, 1);
+    }
+
+    index = find_anim_name(name);
+    if (index < 0) {
+        index = first_free_anim();
+        if (index < 0) {
+            for (i = 0; i < count; ++i)
+                free(frames[i]);
+            free(frames);
+            return luaL_error(L, "draw.anim: too many animations (max %d)",
+                              ANIM_MAX);
+        }
+        memcpy(g_anims[index].name, name, name_len + 1);
+        g_anims[index].used = 1;
+    } else {
+        free_anim(&g_anims[index]);
+    }
+
+    g_anims[index].frames = frames;
+    g_anims[index].count = (int)count;
+    g_anims[index].fps = fps;
+    g_anims[index].started = SDL_GetTicks();
+
+    lua_pushinteger(L, index + 1);
+    return 1;
+}
+
+typedef struct {
+    uint32_t key;
+    int count;
+} ImageColor;
+
+static ImageColor *g_image_colors;
+
+typedef struct {
+    int lo;
+    int hi;
+    int rmin, rmax;
+    int gmin, gmax;
+    int bmin, bmax;
+    int pixels;
+} ImageBox;
+
+static int g_image_sort_channel;
+
+static int image_key(uint32_t key)
+{
+    return (int)(key & 0xffu);
+}
+
+static int image_key_r(uint32_t key)
+{
+    return (int)((key >> 16) & 0xffu);
+}
+
+static int image_key_g(uint32_t key)
+{
+    return (int)((key >> 8) & 0xffu);
+}
+
+static uint32_t image_make_key(int r, int g, int b)
+{
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+static int image_u32_cmp(const void *a, const void *b)
+{
+    uint32_t ka = *(const uint32_t *)a;
+    uint32_t kb = *(const uint32_t *)b;
+
+    return ka < kb ? -1 : (ka > kb ? 1 : 0);
+}
+
+static int image_order_cmp(const void *a, const void *b)
+{
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    int va;
+    int vb;
+
+    if (g_image_sort_channel == 0)
+        return g_image_colors[ia].key < g_image_colors[ib].key ? -1 :
+               (g_image_colors[ia].key > g_image_colors[ib].key ? 1 : 0);
+    if (g_image_sort_channel == 1) {
+        va = image_key_r(g_image_colors[ia].key);
+        vb = image_key_r(g_image_colors[ib].key);
+    } else if (g_image_sort_channel == 2) {
+        va = image_key_g(g_image_colors[ia].key);
+        vb = image_key_g(g_image_colors[ib].key);
+    } else {
+        va = image_key(g_image_colors[ia].key);
+        vb = image_key(g_image_colors[ib].key);
+    }
+    return va < vb ? -1 : (va > vb ? 1 : 0);
+}
+
+static void image_box_init(ImageBox *box, const ImageColor *colors, int lo,
+                           int hi)
+{
+    int i;
+
+    box->lo = lo;
+    box->hi = hi;
+    box->rmin = box->gmin = box->bmin = 255;
+    box->rmax = box->gmax = box->bmax = 0;
+    box->pixels = 0;
+    for (i = lo; i <= hi; ++i) {
+        int r = image_key_r(colors[i].key);
+        int g = image_key_g(colors[i].key);
+        int b = image_key(colors[i].key);
+
+        if (r < box->rmin) box->rmin = r;
+        if (r > box->rmax) box->rmax = r;
+        if (g < box->gmin) box->gmin = g;
+        if (g > box->gmax) box->gmax = g;
+        if (b < box->bmin) box->bmin = b;
+        if (b > box->bmax) box->bmax = b;
+        box->pixels += colors[i].count;
+    }
+}
+
+static int image_nearest_palette(uint32_t key, const uint32_t *palette,
+                                 int count)
+{
+    int best = 0;
+    long long best_dist = LLONG_MAX;
+    int i;
+
+    for (i = 0; i < count; ++i) {
+        int dr = image_key_r(key) - image_key_r(palette[i]);
+        int dg = image_key_g(key) - image_key_g(palette[i]);
+        int db = image_key(key) - image_key(palette[i]);
+        long long dist = (long long)dr * dr + (long long)dg * dg +
+                         (long long)db * db;
+
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static int image_quantize(const unsigned char *pixels, int w, int h,
+                          int channels, int alpha_threshold, int maxcolors,
+                          int **out_indices, int *out_colors,
+                          uint32_t *out_palette)
+{
+    uint32_t *keys = NULL;
+    ImageColor *colors = NULL;
+    ImageBox *boxes = NULL;
+    int *order = NULL;
+    int *mapping = NULL;
+    int *result = NULL;
+    int key_count = 0;
+    int unique = 0;
+    int color_inputs = 0;
+    int box_count = 0;
+    int i;
+    int rc = -1;
+
+    for (i = 0; i < w * h; ++i) {
+        if (pixels[i * channels + 3] >= alpha_threshold)
+            ++key_count;
+    }
+    if (key_count == 0)
+        return -1;
+
+    keys = (uint32_t *)malloc((size_t)key_count * sizeof(uint32_t));
+    if (!keys)
+        return -2;
+    key_count = 0;
+    for (i = 0; i < w * h; ++i) {
+        unsigned char a = pixels[i * channels + 3];
+
+        if (a >= alpha_threshold) {
+            keys[key_count++] = image_make_key(pixels[i * channels],
+                                               pixels[i * channels + 1],
+                                               pixels[i * channels + 2]);
+        }
+    }
+    qsort(keys, (size_t)key_count, sizeof(uint32_t), image_u32_cmp);
+
+    colors = (ImageColor *)malloc((size_t)key_count * sizeof(ImageColor));
+    if (!colors) {
+        rc = -2;
+        goto done;
+    }
+    for (i = 0; i < key_count; ++i) {
+        if (i == 0 || keys[i] != keys[i - 1]) {
+            colors[unique].key = keys[i];
+            colors[unique].count = 1;
+            ++unique;
+        } else {
+            --unique;
+            ++colors[unique].count;
+            ++unique;
+        }
+    }
+    color_inputs = unique;
+
+    if (unique <= maxcolors) {
+        for (i = 0; i < unique; ++i)
+            out_palette[i] = colors[i].key;
+        mapping = NULL;
+    } else {
+        boxes = (ImageBox *)malloc((size_t)maxcolors * sizeof(ImageBox));
+        order = (int *)malloc((size_t)color_inputs * sizeof(int));
+        mapping = (int *)malloc((size_t)color_inputs * sizeof(int));
+        if (!boxes || !order || !mapping) {
+            rc = -2;
+            goto done;
+        }
+        for (i = 0; i < color_inputs; ++i)
+            order[i] = i;
+        g_image_colors = colors;
+        image_box_init(&boxes[0], colors, 0, color_inputs - 1);
+        box_count = 1;
+
+        while (box_count < maxcolors) {
+            int best = -1;
+            long long best_score = -1;
+            int channel = 0;
+            int len;
+            int half;
+
+            for (i = 0; i < box_count; ++i) {
+                int rr = boxes[i].rmax - boxes[i].rmin;
+                int gg = boxes[i].gmax - boxes[i].gmin;
+                int bb = boxes[i].bmax - boxes[i].bmin;
+                int range = rr;
+                long long score;
+
+                if (gg > range) range = gg;
+                if (bb > range) range = bb;
+                score = ((long long)range + 1) * boxes[i].pixels;
+                if (boxes[i].hi > boxes[i].lo && score > best_score) {
+                    best_score = score;
+                    best = i;
+                    channel = rr >= gg && rr >= bb ? 1
+                            : (gg >= bb ? 2 : 3);
+                }
+            }
+            if (best < 0)
+                break;
+
+            g_image_sort_channel = channel;
+            len = boxes[best].hi - boxes[best].lo + 1;
+            qsort(order + boxes[best].lo, (size_t)len, sizeof(int),
+                  image_order_cmp);
+            half = len / 2;
+            if (half < 1) half = 1;
+            if (half >= len) half = len - 1;
+
+            image_box_init(&boxes[box_count], colors,
+                           boxes[best].lo + half, boxes[best].hi);
+            image_box_init(&boxes[best], colors,
+                           boxes[best].lo, boxes[best].lo + half - 1);
+            ++box_count;
+        }
+
+        for (i = 0; i < box_count; ++i) {
+            ImageBox *box = &boxes[i];
+            long long sr = 0, sg = 0, sb = 0, total = 0;
+            int j;
+
+            for (j = box->lo; j <= box->hi; ++j) {
+                int count = colors[j].count;
+
+                sr += (long long)image_key_r(colors[j].key) * count;
+                sg += (long long)image_key_g(colors[j].key) * count;
+                sb += (long long)image_key(colors[j].key) * count;
+                total += count;
+            }
+            out_palette[i] = image_make_key((int)(sr / total),
+                                            (int)(sg / total),
+                                            (int)(sb / total));
+        }
+        for (i = 0; i < color_inputs; ++i)
+            mapping[i] = image_nearest_palette(colors[i].key, out_palette,
+                                               box_count);
+        unique = box_count;
+    }
+
+    result = (int *)malloc((size_t)w * h * sizeof(int));
+    if (!result) {
+        rc = -2;
+        goto done;
+    }
+    for (i = 0; i < w * h; ++i) {
+        int pos = -1;
+        int lo = 0;
+        int hi = color_inputs - 1;
+        uint32_t key;
+
+        if (pixels[i * channels + 3] < alpha_threshold) {
+            result[i] = -1;
+            continue;
+        }
+        key = image_make_key(pixels[i * channels],
+                             pixels[i * channels + 1],
+                             pixels[i * channels + 2]);
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            uint32_t mid_key = colors[mid].key;
+
+            if (mid_key == key) {
+                pos = mid;
+                break;
+            }
+            if (mid_key < key)
+                lo = mid + 1;
+            else
+                hi = mid - 1;
+        }
+        if (pos < 0) {
+            rc = -1;
+            goto done;
+        }
+        result[i] = mapping ? mapping[pos] : pos;
+    }
+
+    *out_indices = result;
+    *out_colors = unique;
+    result = NULL;
+    rc = 0;
+
+done:
+    g_image_colors = NULL;
+    free(keys);
+    free(colors);
+    free(boxes);
+    free(order);
+    free(mapping);
+    free(result);
+    return rc;
+}
+
+static unsigned char *load_rgba_file(const char *path, int *w, int *h,
+                                     char *err, size_t err_size)
+{
+    SDL_Surface *src;
+    SDL_Surface *rgba;
+    unsigned char *data;
+    size_t row;
+    size_t total;
+
+    src = IMG_Load(path);
+    if (!src) {
+        snprintf(err, err_size, "%s", IMG_GetError());
+        return NULL;
+    }
+    rgba = SDL_ConvertSurfaceFormat(src, SDL_PIXELFORMAT_RGBA32, 0);
+    SDL_FreeSurface(src);
+    if (!rgba) {
+        snprintf(err, err_size, "%s", SDL_GetError());
+        return NULL;
+    }
+    if (rgba->w <= 0 || rgba->h <= 0 || rgba->w > IMAGE_MAX_DIM ||
+        rgba->h > IMAGE_MAX_DIM || (size_t)rgba->w > SIZE_MAX / 4 ||
+        (size_t)rgba->h > SIZE_MAX / ((size_t)rgba->w * 4)) {
+        SDL_FreeSurface(rgba);
+        snprintf(err, err_size, "image is too large");
+        return NULL;
+    }
+    total = (size_t)rgba->w * (size_t)rgba->h * 4;
+    data = (unsigned char *)malloc(total);
+    if (!data) {
+        SDL_FreeSurface(rgba);
+        snprintf(err, err_size, "out of memory");
+        return NULL;
+    }
+    for (row = 0; row < (size_t)rgba->h; ++row) {
+        memcpy(data + row * (size_t)rgba->w * 4,
+               (unsigned char *)rgba->pixels + row * (size_t)rgba->pitch,
+               (size_t)rgba->w * 4);
+    }
+    *w = rgba->w;
+    *h = rgba->h;
+    SDL_FreeSurface(rgba);
+    return data;
+}
+
+static int l_font(lua_State *L)
+{
+    const char *name;
+    const char *path;
+    size_t name_len;
+    int cell_w;
+    int cell_h;
+    int first;
+    int scale;
+    int w, h;
+    unsigned char *data;
+    char err[256];
+    int cols, rows, count, stride;
+    int has_alpha = 0;
+    unsigned char *masks = NULL;
+    FontEntry *font;
+    int index;
+    int gx, gy, px, py;
+    size_t i;
+    size_t total;
+
+    name = luaL_checkstring(L, 1);
+    path = luaL_checkstring(L, 2);
+    name_len = strlen(name);
+    if (name_len == 0)
+        return luaL_error(L, "draw.font: name must not be empty");
+    if (name_len >= FONT_NAME_MAX)
+        return luaL_error(L, "draw.font: name is too long");
+
+    cell_w = (int)luaL_optinteger(L, 3, 8);
+    cell_h = (int)luaL_optinteger(L, 4, 8);
+    first = (int)luaL_optinteger(L, 5, 32);
+    scale = (int)luaL_optinteger(L, 6, 1);
+    if (cell_w < 1 || cell_w > 64 || cell_h < 1 || cell_h > 64)
+        return luaL_error(L, "draw.font: cell size must be 1..64");
+    if (first < 0 || first >= FONT_CHARS_MAX)
+        return luaL_error(L, "draw.font: first code must be 0..255");
+    if (scale < 1 || scale > 16)
+        return luaL_error(L, "draw.font: scale must be 1..16");
+
+    data = load_rgba_file(path, &w, &h, err, sizeof(err));
+    if (!data)
+        return luaL_error(L, "draw.font: cannot load '%s': %s", path, err);
+    cols = w / cell_w;
+    rows = h / cell_h;
+    if (cols <= 0 || rows <= 0 || cols > FONT_CHARS_MAX ||
+        rows > FONT_CHARS_MAX || cols > INT_MAX / rows) {
+        free(data);
+        return luaL_error(L, "draw.font: invalid glyph grid");
+    }
+    count = cols * rows;
+    if (count > FONT_CHARS_MAX - first) {
+        free(data);
+        return luaL_error(L, "draw.font: glyph codes are out of range");
+    }
+    stride = (cell_w + 7) / 8;
+    total = (size_t)count * (size_t)cell_h * (size_t)stride;
+    masks = (unsigned char *)calloc(total, 1);
+    if (!masks) {
+        free(data);
+        return luaL_error(L, "draw.font: out of memory");
+    }
+
+    for (i = 0; i < (size_t)w * h * 4; i += 4) {
+        if (data[i + 3] != 255) {
+            has_alpha = 1;
+            break;
+        }
+    }
+
+    for (gy = 0; gy < rows; ++gy) {
+        for (gx = 0; gx < cols; ++gx) {
+            unsigned char *glyph = masks +
+                (size_t)(gy * cols + gx) * cell_h * stride;
+
+            for (py = 0; py < cell_h; ++py) {
+                for (px = 0; px < cell_w; ++px) {
+                    size_t pos = ((size_t)(gy * cell_h + py) * w +
+                                  (size_t)(gx * cell_w + px)) * 4;
+                    int set;
+
+                    if (has_alpha) {
+                        set = data[pos + 3] >= 128;
+                    } else {
+                        int luma = (data[pos] * 299 + data[pos + 1] * 587 +
+                                    data[pos + 2] * 114) / 1000;
+
+                        set = luma < 128;
+                    }
+                    if (set)
+                        glyph[py * stride + px / 8] |=
+                            (unsigned char)(0x80 >> (px % 8));
+                }
+            }
+        }
+    }
+    free(data);
+
+    index = find_font_name(name);
+    if (index < 0) {
+        index = first_free_font();
+        if (index < 0) {
+            free(masks);
+            return luaL_error(L, "draw.font: too many fonts (max %d)",
+                              FONT_MAX);
+        }
+        memcpy(g_fonts[index].name, name, name_len + 1);
+        g_fonts[index].used = 1;
+    } else {
+        free_font(&g_fonts[index]);
+    }
+
+    font = &g_fonts[index];
+    font->first = first;
+    font->count = count;
+    font->cell_w = cell_w;
+    font->cell_h = cell_h;
+    font->stride = stride;
+    font->scale = scale;
+    font->masks = masks;
+
+    lua_pushinteger(L, index + 1);
+    return 1;
+}
+
+static int l_spriteimage(lua_State *L)
+{
+    const char *name;
+    const char *path;
+    size_t name_len;
+    int maxcolors;
+    int alpha_threshold;
+    int w, h;
+    unsigned char *data;
+    char err[256];
+    int *indices = NULL;
+    uint32_t palette[PALETTE_INDEX_MAX + 1];
+    int color_count = 0;
+    int first_palette = 0;
+    int *sprite_pixels = NULL;
+    int width, height;
+    int index;
+    int qrc;
+    size_t total;
+
+    name = luaL_checkstring(L, 1);
+    path = luaL_checkstring(L, 2);
+    name_len = strlen(name);
+    if (name_len == 0)
+        return luaL_error(L, "draw.spriteimage: name must not be empty");
+    if (name_len >= SPRITE_NAME_MAX)
+        return luaL_error(L, "draw.spriteimage: name is too long");
+
+    maxcolors = (int)luaL_optinteger(L, 3, 256);
+    alpha_threshold = clamp_color((int)luaL_optinteger(L, 4, 128));
+    if (maxcolors < 2 || maxcolors > PALETTE_INDEX_MAX + 1)
+        return luaL_error(L, "draw.spriteimage: maxcolors must be 2..1024");
+
+    data = load_rgba_file(path, &w, &h, err, sizeof(err));
+    if (!data)
+        return luaL_error(L, "draw.spriteimage: cannot load '%s': %s", path,
+                          err);
+    total = (size_t)w * (size_t)h;
+    if (total > IMAGE_MAX_PIXELS) {
+        free(data);
+        return luaL_error(L, "draw.spriteimage: image is too large");
+    }
+
+    qrc = image_quantize(data, w, h, 4, alpha_threshold, maxcolors,
+                         &indices, &color_count, palette);
+    if (qrc != 0) {
+        free(data);
+        free(indices);
+        if (qrc == -2)
+            return luaL_error(L, "draw.spriteimage: out of memory");
+        return luaL_error(L, "draw.spriteimage: image has no visible pixels");
+    }
+
+    {
+        int available = 0;
+        int i;
+
+        for (i = 0; i < g_palette_count; ++i) {
+            if (!g_palette[i].used)
+                ++available;
+        }
+        int needed = color_count - available;
+
+        if (needed < 0)
+            needed = 0;
+        if (g_palette_count + needed > PALETTE_INDEX_MAX + 1) {
+            free(data);
+            free(indices);
+            return luaL_error(L, "draw.spriteimage: not enough palette slots");
+        }
+    }
+
+    for (int i = 0; i < color_count; ++i) {
+        int r = image_key_r(palette[i]);
+        int g = image_key_g(palette[i]);
+        int b = image_key(palette[i]);
+        int pi = auto_palette_add(name, i, r, g, b, 255);
+
+        if (pi < 0) {
+            free(data);
+            free(indices);
+            return luaL_error(L, "draw.spriteimage: cannot create palette");
+        }
+        if (i == 0)
+            first_palette = pi;
+        for (size_t j = 0; j < total; ++j) {
+            if (indices[j] == i)
+                indices[j] = pi;
+        }
+    }
+
+    width = w;
+    height = h;
+    sprite_pixels = (int *)malloc(total * sizeof(int));
+    if (!sprite_pixels) {
+        free(data);
+        free(indices);
+        return luaL_error(L, "draw.spriteimage: out of memory");
+    }
+    memcpy(sprite_pixels, indices, total * sizeof(int));
+    free(data);
+    free(indices);
+
+    index = find_sprite_name(name);
+    if (index < 0) {
+        index = first_free_sprite();
+        if (index < 0) {
+            free(sprite_pixels);
+            return luaL_error(L, "draw.spriteimage: too many sprites (max %d)",
+                              SPRITE_MAX);
+        }
+        memcpy(g_sprites[index].name, name, name_len + 1);
+        g_sprites[index].used = 1;
+    } else {
+        free(g_sprites[index].pixels);
+    }
+    g_sprites[index].pixels = sprite_pixels;
+    g_sprites[index].width = width;
+    g_sprites[index].height = height;
+
+    lua_pushinteger(L, index);
+    lua_pushinteger(L, first_palette);
+    lua_pushinteger(L, color_count);
+    return 3;
+}
+
 static int l_draw_sprite(lua_State *L)
 {
     lua_Integer x, y;
@@ -1961,6 +3916,7 @@ static int l_draw_sprite(lua_State *L)
     int angle;
     int flipx;
     int flipy;
+    int tr, tg, tb, ta;
     int step;
     int index;
     int sx, sy;
@@ -1971,11 +3927,16 @@ static int l_draw_sprite(lua_State *L)
     size_t i;
     size_t count;
     SpriteEntry *sprite;
+    AnimEntry *anim = NULL;
     double W, H, bw, bh;
     double xd, yd;
-    double half_w, half_h, half_bw, half_bh;
+    double pivot_x, pivot_y;
+    double px, py;
+    double min_x = 0.0, max_x = 0.0, min_y = 0.0, max_y = 0.0;
     double c, s;
-    double dx, dy, src_cx, src_cy, p, q;
+    double dx, dy, rot_x, rot_y, src_cx, src_cy, p, q;
+    int k;
+    int pivot_given;
 
     if (!ensure_open(L, "draw.draw"))
         return 0;
@@ -1987,11 +3948,28 @@ static int l_draw_sprite(lua_State *L)
     angle = parse_angle(L, 5);
     flipx = parse_flip(L, 6, "flipx");
     flipy = parse_flip(L, 7, "flipy");
+    if (parse_tint(L, 8, &tr, &tg, &tb, &ta) != 0)
+        return 0;
 
     index = find_sprite_name(name);
+    if (index < 0) {
+        int ai = find_anim_name(name);
+
+        if (ai >= 0) {
+            anim = &g_anims[ai];
+            if (anim->count > 0) {
+                Uint32 now = SDL_GetTicks();
+                double elapsed = (double)(now - anim->started) / 1000.0;
+                int frame = (int)(elapsed * anim->fps) % anim->count;
+
+                name = anim->frames[frame];
+                index = find_sprite_name(name);
+            }
+        }
+    }
     if (index < 0)
         return luaL_error(L,
-            "draw.draw: sprite '%s' is not defined", name);
+            "draw.draw: sprite or animation '%s' is not defined", name);
 
     sprite = &g_sprites[index];
     count = (size_t)sprite->width * (size_t)sprite->height;
@@ -2009,41 +3987,71 @@ static int l_draw_sprite(lua_State *L)
     step = angle / 45;
     W = (double)sprite->width * (double)scale;
     H = (double)sprite->height * (double)scale;
+    c = k_cos[step];
+    s = k_sin[step];
 
-    if (step == 0 || step == 4) {
-        bw = W;
-        bh = H;
-    } else if (step == 2 || step == 6) {
-        bw = H;
-        bh = W;
-    } else {
-        bw = ceil((W + H) * k_diag);
-        bh = bw;
+    pivot_given = !lua_isnoneornil(L, 9) || !lua_isnoneornil(L, 10);
+    pivot_x = luaL_optnumber(L, 9, (lua_Number)sprite->width / 2.0);
+    pivot_y = luaL_optnumber(L, 10, (lua_Number)sprite->height / 2.0);
+    if (!isfinite(pivot_x) || !isfinite(pivot_y) || pivot_x < -1000000.0 ||
+        pivot_x > 1000000.0 || pivot_y < -1000000.0 ||
+        pivot_y > 1000000.0)
+        return luaL_error(L,
+            "draw.draw: pivot must be finite and within +/-1000000");
+    if (flipx)
+        pivot_x = (double)sprite->width - pivot_x;
+    if (flipy)
+        pivot_y = (double)sprite->height - pivot_y;
+    px = pivot_x * (double)scale;
+    py = pivot_y * (double)scale;
+
+    for (k = 0; k < 4; ++k) {
+        double vx = (k & 1) ? W - px : -px;
+        double vy = (k & 2) ? H - py : -py;
+        double rx = vx * c - vy * s;
+        double ry = vx * s + vy * c;
+
+        if (k == 0) {
+            min_x = max_x = rx;
+            min_y = max_y = ry;
+        } else {
+            if (rx < min_x) min_x = rx;
+            if (rx > max_x) max_x = rx;
+            if (ry < min_y) min_y = ry;
+            if (ry > max_y) max_y = ry;
+        }
     }
+    bw = max_x - min_x;
+    bh = max_y - min_y;
 
     xd = (double)x;
     yd = (double)y;
 
-    if (!visible_range(xd, bw, g_draw.width, &sx0, &sx1) ||
-        !visible_range(yd, bh, g_draw.height, &sy0, &sy1))
-        return 0;
-
-    half_w = W / 2.0;
-    half_h = H / 2.0;
-    half_bw = bw / 2.0;
-    half_bh = bh / 2.0;
-    c = k_cos[step];
-    s = k_sin[step];
+    if (pivot_given) {
+        if (!visible_range(xd + min_x, bw, g_draw.width, &sx0, &sx1) ||
+            !visible_range(yd + min_y, bh, g_draw.height, &sy0, &sy1))
+            return 0;
+    } else {
+        if (!visible_range(xd, bw, g_draw.width, &sx0, &sx1) ||
+            !visible_range(yd, bh, g_draw.height, &sy0, &sy1))
+            return 0;
+    }
 
     for (sy = sy0; sy <= sy1; ++sy) {
-        dy = (double)sy + 0.5 - yd - half_bh;
+        dy = (double)sy + 0.5 - yd;
+        if (!pivot_given)
+            dy += min_y;
 
         for (sx = sx0; sx <= sx1; ++sx) {
-            dx = (double)sx + 0.5 - xd - half_bw;
-            src_cx = dx * c + dy * s;
-            src_cy = -dx * s + dy * c;
-            p = src_cx + half_w;
-            q = src_cy + half_h;
+            dx = (double)sx + 0.5 - xd;
+            if (!pivot_given)
+                dx += min_x;
+            rot_x = dx;
+            rot_y = dy;
+            src_cx = rot_x * c + rot_y * s;
+            src_cy = -rot_x * s + rot_y * c;
+            p = src_cx + px;
+            q = src_cy + py;
 
             if (p < 0.0 || p >= W || q < 0.0 || q >= H)
                 continue;
@@ -2062,10 +4070,14 @@ static int l_draw_sprite(lua_State *L)
             if (value < 0)
                 continue;
 
-            color = make_color(g_palette[value].r,
-                               g_palette[value].g,
-                               g_palette[value].b);
-            g_draw.pixels[(size_t)sy * g_draw.width + sx] = color;
+            color = make_color(
+                (g_palette[value].r * tr) / 255,
+                (g_palette[value].g * tg) / 255,
+                (g_palette[value].b * tb) / 255,
+                (g_palette[value].a * ta) / 255);
+            g_draw.pixels[(size_t)sy * g_draw.width + sx] =
+                blend_color(g_draw.pixels[(size_t)sy * g_draw.width + sx],
+                            color);
         }
     }
 
@@ -2075,7 +4087,7 @@ static int l_draw_sprite(lua_State *L)
 
 static int l_clear(lua_State *L)
 {
-    int r, g, b;
+    int r, g, b, a;
     uint32_t color;
     size_t count;
     size_t i;
@@ -2083,12 +4095,12 @@ static int l_clear(lua_State *L)
     if (!ensure_open(L, "draw.clear"))
         return 0;
 
-    if (read_color(L, 1, &r, &g, &b) < 0) {
+    if (read_color(L, 1, &r, &g, &b, &a) < 0) {
         r = 0;
         g = 0;
         b = 0;
     }
-    color = make_color(r, g, b);
+    color = make_color(r, g, b, a);
 
     count = (size_t)g_draw.width * (size_t)g_draw.height;
     for (i = 0; i < count; ++i)
@@ -2101,17 +4113,17 @@ static int l_clear(lua_State *L)
 static int l_pixel(lua_State *L)
 {
     lua_Integer x, y;
-    int r, g, b;
+    int r, g, b, a;
 
     if (!ensure_open(L, "draw.pixel"))
         return 0;
 
     x = luaL_checkinteger(L, 1);
     y = luaL_checkinteger(L, 2);
-    if (read_color(L, 3, &r, &g, &b) < 0)
+    if (read_color(L, 3, &r, &g, &b, &a) < 0)
         return luaL_error(L, "draw.pixel: expected a color");
 
-    put_pixel((long long)x, (long long)y, make_color(r, g, b));
+    put_pixel((long long)x, (long long)y, make_color(r, g, b, a));
     return 0;
 }
 
@@ -2136,7 +4148,8 @@ static int l_getpixel(lua_State *L)
     lua_pushinteger(L, (int)((color >> 16) & 0xFF));
     lua_pushinteger(L, (int)((color >> 8) & 0xFF));
     lua_pushinteger(L, (int)(color & 0xFF));
-    return 3;
+    lua_pushinteger(L, (int)((color >> 24) & 0xFF));
+    return 4;
 }
 
 static int l_width(lua_State *L)
@@ -2173,6 +4186,17 @@ static int l_delta(lua_State *L)
 {
     lua_pushnumber(L, (lua_Number)g_draw.frame_delta);
     return 1;
+}
+
+static int l_alpha(lua_State *L)
+{
+    if (lua_isnoneornil(L, 1)) {
+        lua_pushinteger(L, g_draw.alpha);
+        return 1;
+    }
+
+    g_draw.alpha = clamp_color(luaL_checkinteger(L, 1));
+    return 0;
 }
 
 static int l_mouse(lua_State *L)
@@ -2275,7 +4299,7 @@ static int l_wheel(lua_State *L)
 static int l_line(lua_State *L)
 {
     lua_Integer x1, y1, x2, y2;
-    int r, g, b;
+    int r, g, b, a;
     int fill;
     int width;
 
@@ -2293,21 +4317,21 @@ static int l_line(lua_State *L)
         y2 < -1000000000LL || y2 > 1000000000LL)
         return luaL_error(L, "draw.line: coordinates are too large");
 
-    if (read_color(L, 5, &r, &g, &b) < 0)
+    if (read_color(L, 5, &r, &g, &b, &a) < 0)
         return luaL_error(L, "draw.line: expected a color");
     fill = read_fill(L, 5, "draw.line");
     width = fill <= 0 ? 1 : fill;
 
     draw_line((long long)x1, (long long)y1,
               (long long)x2, (long long)y2,
-              width, make_color(r, g, b));
+              width, make_color(r, g, b, a));
     return 0;
 }
 
 static int l_circle(lua_State *L)
 {
     lua_Integer x, y, radius;
-    int r, g, b;
+    int r, g, b, a;
     int fill;
 
     if (!ensure_open(L, "draw.circle"))
@@ -2325,19 +4349,19 @@ static int l_circle(lua_State *L)
         y < -1000000000LL || y > 1000000000LL)
         return luaL_error(L, "draw.circle: coordinates are too large");
 
-    if (read_color(L, 4, &r, &g, &b) < 0)
+    if (read_color(L, 4, &r, &g, &b, &a) < 0)
         return luaL_error(L, "draw.circle: expected a color");
     fill = read_fill(L, 4, "draw.circle");
 
     fill_circle((long long)x, (long long)y, (long long)radius,
-                fill, make_color(r, g, b));
+                fill, make_color(r, g, b, a));
     return 0;
 }
 
 static int l_square(lua_State *L)
 {
     lua_Integer x, y, w, h;
-    int r, g, b;
+    int r, g, b, a;
     int fill;
 
     if (!ensure_open(L, "draw.square"))
@@ -2354,19 +4378,19 @@ static int l_square(lua_State *L)
         h < -1000000000LL || h > 1000000000LL)
         return luaL_error(L, "draw.square: coordinates are too large");
 
-    if (read_color(L, 5, &r, &g, &b) < 0)
+    if (read_color(L, 5, &r, &g, &b, &a) < 0)
         return luaL_error(L, "draw.square: expected a color");
     fill = read_fill(L, 5, "draw.square");
 
     fill_rect((long long)x, (long long)y, (long long)w, (long long)h,
-              fill, make_color(r, g, b));
+              fill, make_color(r, g, b, a));
     return 0;
 }
 
 static int l_triangle(lua_State *L)
 {
     lua_Integer x1, y1, x2, y2, x3, y3;
-    int r, g, b;
+    int r, g, b, a;
     int fill;
 
     if (!ensure_open(L, "draw.triangle"))
@@ -2387,14 +4411,14 @@ static int l_triangle(lua_State *L)
         y3 < -TRIANGLE_COORD_LIMIT || y3 > TRIANGLE_COORD_LIMIT)
         return luaL_error(L, "draw.triangle: coordinates are too large");
 
-    if (read_color(L, 7, &r, &g, &b) < 0)
+    if (read_color(L, 7, &r, &g, &b, &a) < 0)
         return luaL_error(L, "draw.triangle: expected a color");
     fill = read_fill(L, 7, "draw.triangle");
 
     fill_triangle((long long)x1, (long long)y1,
                   (long long)x2, (long long)y2,
                   (long long)x3, (long long)y3,
-                  fill, make_color(r, g, b));
+                  fill, make_color(r, g, b, a));
     return 0;
 }
 
@@ -2405,11 +4429,14 @@ static int l_text(lua_State *L)
     const char *text;
     size_t len;
     int font;
-    int r, g, b;
-    int size;
+    int r, g, b, a;
+    int size = 8;
     long long start_x;
     size_t i;
     uint32_t color;
+    FontEntry *custom = NULL;
+    int advance_x;
+    int advance_y;
     static const int sizes[4] = {4, 8, 16, 24};
 
     if (!ensure_open(L, "draw.text"))
@@ -2423,47 +4450,88 @@ static int l_text(lua_State *L)
     y = (long long)luaL_checkinteger(L, 2);
     text = luaL_checklstring(L, 3, &len);
 
-    font = (int)luaL_optinteger(L, 4, 1);
-    if (read_color(L, 5, &r, &g, &b) < 0) {
+    if (lua_type(L, 4) == LUA_TSTRING) {
+        int fi = find_font_name(lua_tostring(L, 4));
+
+        if (fi < 0)
+            return luaL_error(L, "draw.text: font '%s' is not defined",
+                              lua_tostring(L, 4));
+        custom = &g_fonts[fi];
+    } else {
+        font = (int)luaL_optinteger(L, 4, 1);
+        if (font < 0)
+            font = 0;
+        if (font > 3)
+            font = 3;
+        size = sizes[font];
+    }
+
+    if (read_color(L, 5, &r, &g, &b, &a) < 0) {
         r = 255;
         g = 255;
         b = 255;
     }
 
-    if (font < 0)
-        font = 0;
-    if (font > 3)
-        font = 3;
-
-    size = sizes[font];
-    color = make_color(r, g, b);
+    if (custom) {
+        advance_x = custom->cell_w * custom->scale + 1;
+        advance_y = custom->cell_h * custom->scale + 1;
+    } else {
+        advance_x = size + 1;
+        advance_y = size + 1;
+    }
+    color = make_color(r, g, b, a);
     start_x = x;
 
     for (i = 0; i < len; ++i) {
         unsigned char ch = (unsigned char)text[i];
         const unsigned char *glyph;
-        int dx, dy;
 
         if (ch == '\n') {
             x = start_x;
-            y += size + 1;
+            y += advance_y;
             continue;
         }
         if (ch == '\r')
             continue;
-        if (ch < 32 || ch > 127)
-            continue;
 
-        glyph = font8x8[ch];
+        if (custom) {
+            int code = (int)ch - custom->first;
+            int dx, dy;
 
-        for (dy = 0; dy < size; ++dy) {
-            for (dx = 0; dx < size; ++dx) {
-                if (glyph_pixel(glyph, dx, dy, size))
-                    put_pixel(x + dx, y + dy, color);
+            if (code < 0 || code >= custom->count)
+                continue;
+            glyph = custom->masks +
+                    (size_t)code * custom->cell_h * custom->stride;
+            for (dy = 0; dy < custom->cell_h * custom->scale; ++dy) {
+                int sy = dy / custom->scale;
+
+                for (dx = 0; dx < custom->cell_w * custom->scale; ++dx) {
+                    int sx = dx / custom->scale;
+                    int bit = (glyph[sy * custom->stride + sx / 8] >>
+                               (7 - (sx % 8))) & 1;
+
+                    if (bit)
+                        put_pixel(x + dx, y + dy, color);
+                }
             }
+            x += advance_x;
+            continue;
         }
 
-        x += size + 1;
+        if (ch < 32 || ch > 127)
+            continue;
+        glyph = font8x8[ch];
+        {
+            int dx, dy;
+
+            for (dy = 0; dy < size; ++dy) {
+                for (dx = 0; dx < size; ++dx) {
+                    if (glyph_pixel(glyph, dx, dy, size))
+                        put_pixel(x + dx, y + dy, color);
+                }
+            }
+        }
+        x += advance_x;
     }
 
     return 0;
@@ -2488,12 +4556,425 @@ static void free_sprites(void)
     }
 }
 
+static int l_melody(lua_State *L)
+{
+    const char *name;
+    size_t len;
+    MelodyNote *notes = NULL;
+    MelodyEntry *melody;
+    int count = 0;
+    int cap = 0;
+    int index;
+    int i;
+
+    if (!lua_istable(L, 2))
+        return luaL_error(L, "draw.melody: expected a table of notes");
+
+    name = luaL_checkstring(L, 1);
+    len = strlen(name);
+    if (len == 0)
+        return luaL_error(L, "draw.melody: name must not be empty");
+    if (len >= MELODY_NAME_MAX)
+        return luaL_error(L, "draw.melody: name is too long");
+
+    index = find_melody_name(name);
+    if (index < 0) {
+        index = first_free_melody();
+        if (index < 0)
+            return luaL_error(L, "draw.melody: too many melodies (max %d)",
+                              MELODY_MAX);
+    }
+
+    for (i = 1;; ++i) {
+        MelodyNote note;
+
+        lua_pushinteger(L, i);
+        lua_rawget(L, 2);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            break;
+        }
+
+        if (lua_istable(L, -1)) {
+            lua_pushinteger(L, 1);
+            lua_rawget(L, -2);
+            if (parse_note_scalar(L, -1, &note) != 0) {
+                free(notes);
+                return luaL_error(L,
+                    "draw.melody: note %d must be a name, frequency or rest", i);
+            }
+            lua_pop(L, 1);
+
+            lua_pushinteger(L, 2);
+            lua_rawget(L, -2);
+            note.beats = parse_beats(L, -1);
+            if (note.beats < 0.0) {
+                free(notes);
+                return luaL_error(L,
+                    "draw.melody: note %d duration must be 0..64 beats", i);
+            }
+            lua_pop(L, 1);
+        } else if (parse_note_scalar(L, -1, &note) != 0) {
+            free(notes);
+            return luaL_error(L,
+                "draw.melody: note %d must be a name, frequency or rest", i);
+        }
+
+        if (count == cap) {
+            int new_cap = cap ? cap * 2 : 16;
+            MelodyNote *tmp = (MelodyNote *)realloc(notes,
+                (size_t)new_cap * sizeof(MelodyNote));
+
+            if (!tmp) {
+                free(notes);
+                return luaL_error(L, "draw.melody: out of memory");
+            }
+            notes = tmp;
+            cap = new_cap;
+        }
+        notes[count++] = note;
+        lua_pop(L, 1);
+    }
+
+    melody = &g_melodies[index];
+    free_melody(melody);
+    memcpy(melody->name, name, len + 1);
+    melody->used = 1;
+    melody->kind = AUDIO_KIND_MELODY;
+    melody->notes = notes;
+    melody->count = count;
+
+    lua_pushinteger(L, index + 1);
+    return 1;
+}
+
+static int l_midi(lua_State *L)
+{
+    const char *name;
+    const char *path;
+    size_t name_len;
+    lua_Integer track_opt;
+    unsigned char *data = NULL;
+    size_t size = 0;
+    const unsigned char *p;
+    const unsigned char *end;
+    uint32_t header_len;
+    uint16_t track_count;
+    uint16_t ppq;
+    MidiNote *chosen_midi = NULL;
+    MelodyNote *notes = NULL;
+    int chosen_count = 0;
+    int note_count = 0;
+    unsigned long chosen_tempo = 0;
+    int chosen = 0;
+    int index;
+    int t;
+    int rc;
+    const char *msg = NULL;
+    char msgbuf[128];
+    double speed;
+
+    name = luaL_checkstring(L, 1);
+    path = luaL_checkstring(L, 2);
+    track_opt = luaL_optinteger(L, 3, 0);
+    name_len = strlen(name);
+    if (name_len == 0) {
+        msg = "draw.midi: name must not be empty";
+        goto fail;
+    }
+    if (name_len >= MELODY_NAME_MAX) {
+        msg = "draw.midi: name is too long";
+        goto fail;
+    }
+    if (track_opt < 0) {
+        msg = "draw.midi: track must be positive or zero";
+        goto fail;
+    }
+
+    rc = read_file_bytes(path, &data, &size);
+    if (rc == -2) {
+        msg = "draw.midi: out of memory";
+        goto fail;
+    }
+    if (rc != 0) {
+        snprintf(msgbuf, sizeof(msgbuf),
+                 "draw.midi: cannot read '%s'", path);
+        msg = msgbuf;
+        goto fail;
+    }
+    if (size < 14 || memcmp(data, "MThd", 4) != 0) {
+        msg = "draw.midi: invalid SMF header";
+        goto fail;
+    }
+    header_len = midi_be32(data + 4);
+    if (header_len < 6 || header_len > size - 8) {
+        msg = "draw.midi: invalid SMF header length";
+        goto fail;
+    }
+    track_count = midi_be16(data + 10);
+    ppq = midi_be16(data + 12);
+    if (ppq == 0 || ppq >= 0x8000) {
+        msg = "draw.midi: only PPQN division is supported";
+        goto fail;
+    }
+    if (track_opt > track_count) {
+        msg = "draw.midi: track is out of range";
+        goto fail;
+    }
+
+    p = data + 8 + header_len;
+    end = data + size;
+    for (t = 1; t <= track_count; ++t) {
+        uint32_t chunk_size;
+        MidiNote *track_notes = NULL;
+        int track_count_notes = 0;
+        unsigned long track_tempo = 0;
+
+        if ((size_t)(end - p) < 8) {
+            msg = "draw.midi: truncated track";
+            goto fail;
+        }
+        chunk_size = midi_be32(p + 4);
+        if (memcmp(p, "MTrk", 4) != 0 || chunk_size > (size_t)(end - p - 8)) {
+            msg = "draw.midi: invalid track chunk";
+            goto fail;
+        }
+        p += 8;
+
+        rc = midi_parse_track(p, chunk_size, ppq, &track_notes,
+                              &track_count_notes, &track_tempo);
+        if (rc == -2) {
+            msg = "draw.midi: out of memory";
+            goto fail;
+        }
+        if (rc != 0) {
+            msg = "draw.midi: cannot parse track";
+            goto fail;
+        }
+        p += chunk_size;
+
+        if (track_opt > 0 && t == track_opt) {
+            chosen_midi = track_notes;
+            chosen_count = track_count_notes;
+            chosen_tempo = track_tempo;
+            chosen = 1;
+            break;
+        }
+        if (track_opt == 0 && !chosen && track_count_notes > 0) {
+            chosen_midi = track_notes;
+            chosen_count = track_count_notes;
+            chosen_tempo = track_tempo;
+            chosen = 1;
+        } else {
+            free(track_notes);
+        }
+    }
+
+    if (!chosen || chosen_count == 0) {
+        msg = "draw.midi: no notes found";
+        goto fail;
+    }
+
+    rc = midi_to_melody(chosen_midi, chosen_count, ppq, &notes, &note_count);
+    if (rc == -2) {
+        msg = "draw.midi: out of memory";
+        goto fail;
+    }
+    if (note_count == 0) {
+        msg = "draw.midi: no notes found";
+        goto fail;
+    }
+
+    index = find_melody_name(name);
+    if (index < 0) {
+        index = first_free_melody();
+        if (index < 0) {
+            msg = "draw.midi: too many melodies (max 1024)";
+            goto fail;
+        }
+        memcpy(g_melodies[index].name, name, name_len + 1);
+        g_melodies[index].used = 1;
+    }
+
+    {
+        MelodyEntry *entry = &g_melodies[index];
+
+        free_melody(entry);
+        entry->kind = AUDIO_KIND_MELODY;
+        entry->notes = notes;
+        entry->count = note_count;
+        notes = NULL;
+    }
+
+    speed = chosen_tempo ? 60000000.0 / (double)chosen_tempo : 4.0;
+    if (speed < 0.1)
+        speed = 0.1;
+    if (speed > 64.0)
+        speed = 64.0;
+
+    free(chosen_midi);
+    free(notes);
+    free(data);
+    lua_pushinteger(L, index + 1);
+    lua_pushnumber(L, speed);
+    return 2;
+
+fail:
+    free(chosen_midi);
+    free(notes);
+    free(data);
+    if (msg)
+        return luaL_error(L, "%s", msg);
+    return luaL_error(L, "draw.midi: failed");
+}
+
+static int l_sound(lua_State *L)
+{
+    const char *name;
+    const char *path;
+    size_t len;
+    MelodyEntry loaded;
+    MelodyEntry *entry;
+    int index;
+    int rc;
+
+    name = luaL_checkstring(L, 1);
+    path = luaL_checkstring(L, 2);
+    len = strlen(name);
+    if (len == 0)
+        return luaL_error(L, "draw.sound: name must not be empty");
+    if (len >= MELODY_NAME_MAX)
+        return luaL_error(L, "draw.sound: name is too long");
+
+    memset(&loaded, 0, sizeof(loaded));
+    rc = load_wav(path, &loaded);
+    if (rc == -2)
+        return luaL_error(L, "draw.sound: out of memory");
+    if (rc != 0) {
+        free_melody(&loaded);
+        return luaL_error(L, "draw.sound: cannot load '%s'", path);
+    }
+
+    index = find_melody_name(name);
+    if (index < 0) {
+        index = first_free_melody();
+        if (index < 0) {
+            free_melody(&loaded);
+            return luaL_error(L, "draw.sound: too many sounds (max %d)",
+                              MELODY_MAX);
+        }
+        memcpy(g_melodies[index].name, name, len + 1);
+        g_melodies[index].used = 1;
+    }
+
+    entry = &g_melodies[index];
+    free_melody(entry);
+    entry->kind = loaded.kind;
+    entry->samples = loaded.samples;
+    entry->sample_count = loaded.sample_count;
+    entry->sample_rate = loaded.sample_rate;
+
+    lua_pushinteger(L, index + 1);
+    return 1;
+}
+
+static int l_play(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    int index = find_melody_name(name);
+    MelodyEntry *entry;
+    AudioVoice *voice = NULL;
+    MelodyNote *notes = NULL;
+    int16_t *samples = NULL;
+    size_t bytes;
+    int volume;
+    double speed;
+    int wave;
+    int i;
+
+    if (index < 0)
+        return luaL_error(L, "draw.play: sound '%s' is not defined", name);
+    entry = &g_melodies[index];
+
+    volume = clamp_color((int)luaL_optinteger(L, 2, 128));
+    speed = luaL_optnumber(L, 3,
+        entry->kind == AUDIO_KIND_WAV ? 1.0 : 4.0);
+    wave = parse_wave(L, 4);
+    if (wave < 0)
+        return luaL_error(L, "draw.play: unknown wave");
+    if (speed < 0.01 || speed > 64.0)
+        return luaL_error(L, "draw.play: speed must be 0.01..64");
+    if (ensure_audio_device(L) != 0)
+        return 0;
+
+    if (entry->kind == AUDIO_KIND_MELODY) {
+        bytes = (size_t)entry->count * sizeof(MelodyNote);
+        notes = (MelodyNote *)malloc(bytes ? bytes : 1);
+        if (!notes)
+            return luaL_error(L, "draw.play: out of memory");
+        if (entry->count > 0)
+            memcpy(notes, entry->notes, bytes);
+    } else {
+        bytes = (size_t)entry->sample_count * sizeof(int16_t);
+        samples = (int16_t *)malloc(bytes ? bytes : 1);
+        if (!samples) {
+            free(notes);
+            return luaL_error(L, "draw.play: out of memory");
+        }
+        if (entry->sample_count > 0)
+            memcpy(samples, entry->samples, bytes);
+    }
+
+    SDL_LockMutex(g_audio.mutex);
+    for (i = 0; i < AUDIO_VOICES_MAX; ++i) {
+        if (!g_audio.voices[i].playing) {
+            voice = &g_audio.voices[i];
+            break;
+        }
+    }
+    if (!voice)
+        voice = &g_audio.voices[0];
+    audio_clear_voice(voice);
+
+    voice->kind = entry->kind;
+    voice->notes = notes;
+    voice->count = entry->count;
+    voice->samples = samples;
+    voice->sample_count = entry->sample_count;
+    voice->sample_rate = entry->sample_rate;
+    voice->volume = volume;
+    voice->speed = speed;
+    voice->wave = wave;
+    voice->playing = entry->kind == AUDIO_KIND_WAV
+                         ? entry->sample_count > 0
+                         : entry->count > 0;
+    if (entry->kind == AUDIO_KIND_MELODY)
+        audio_set_note(voice, 0, g_audio.sample_rate);
+    SDL_UnlockMutex(g_audio.mutex);
+
+    SDL_PauseAudioDevice(g_audio.device, 0);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_stop(lua_State *L)
+{
+    (void)L;
+    audio_stop();
+    return 0;
+}
+
 static void auto_close(void)
 {
     if (g_draw.initialized)
         destroy_resources();
+    audio_close();
+    free_melodies();
+    free_anims();
+    free_fonts();
     free_sprites();
     free_palette();
+    IMG_Quit();
 }
 
 static const luaL_Reg draw_lib[] = {
@@ -2506,6 +4987,7 @@ static const luaL_Reg draw_lib[] = {
     {"height",  l_height},
     {"title",   l_title},
     {"delta",   l_delta},
+    {"alpha",   l_alpha},
     {"mouse",   l_mouse},
     {"xymouse", l_xymouse},
     {"mousekey", l_mousekey},
@@ -2521,13 +5003,22 @@ static const luaL_Reg draw_lib[] = {
     {"text",    l_text},
     {"palette", l_palette},
     {"sprite",  l_sprite},
+    {"spriteimage", l_spriteimage},
+    {"font",    l_font},
+    {"anim",    l_anim},
     {"draw",    l_draw_sprite},
+    {"melody",  l_melody},
+    {"midi",    l_midi},
+    {"sound",   l_sound},
+    {"play",    l_play},
+    {"stop",    l_stop},
     {"close",   l_close},
     {NULL, NULL}
 };
 
 int luaopen_draw(lua_State *L)
 {
+    (void)IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG);
     atexit(auto_close);
 
 #if LUA_VERSION_NUM >= 502

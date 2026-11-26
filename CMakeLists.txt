@@ -7,10 +7,21 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 find_package(SDL2 CONFIG REQUIRED)
 find_package(Lua 5.1 REQUIRED)
 
+set(SDL2_IMAGE_TARGET)
+if(WIN32)
+    find_package(SDL2_image CONFIG REQUIRED)
+    set(SDL2_IMAGE_TARGET SDL2_image::SDL2_image)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SDL2_IMAGE REQUIRED IMPORTED_TARGET SDL2_image)
+    set(SDL2_IMAGE_TARGET PkgConfig::SDL2_IMAGE)
+endif()
+
 add_library(draw MODULE draw.c)
 
 target_include_directories(draw PRIVATE ${LUA_INCLUDE_DIR})
-target_link_libraries(draw PRIVATE ${LUA_LIBRARIES} SDL2::SDL2)
+target_link_libraries(draw PRIVATE ${LUA_LIBRARIES} SDL2::SDL2
+    ${SDL2_IMAGE_TARGET})
 
 if(UNIX)
     target_link_libraries(draw PRIVATE m)
