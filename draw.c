@@ -235,6 +235,86 @@ static const size_t g_key_name_count =
 
 static const char *g_mouse_button_names[3] = {"left", "middle", "right"};
 
+#define GAMEPAD_SLOTS 4
+#define GAMEPAD_NAME_MAX 128
+
+typedef struct {
+    SDL_GameController *controller;
+    SDL_JoystickID instance;
+    char name[GAMEPAD_NAME_MAX];
+    int connected;
+    int down[SDL_CONTROLLER_BUTTON_MAX];
+    int pressed[SDL_CONTROLLER_BUTTON_MAX];
+    int last_button;
+    double axis[SDL_CONTROLLER_AXIS_MAX];
+} GamepadState;
+
+typedef struct {
+    const char *name;
+    SDL_GameControllerButton button;
+} GamepadButtonName;
+
+typedef struct {
+    const char *name;
+    SDL_GameControllerAxis axis;
+} GamepadAxisName;
+
+static GamepadState g_gamepads[GAMEPAD_SLOTS];
+static int g_gamecontroller_owned;
+
+static const GamepadButtonName g_gamepad_buttons[] = {
+    {"a", SDL_CONTROLLER_BUTTON_A},
+    {"b", SDL_CONTROLLER_BUTTON_B},
+    {"x", SDL_CONTROLLER_BUTTON_X},
+    {"y", SDL_CONTROLLER_BUTTON_Y},
+    {"back", SDL_CONTROLLER_BUTTON_BACK},
+    {"guide", SDL_CONTROLLER_BUTTON_GUIDE},
+    {"start", SDL_CONTROLLER_BUTTON_START},
+    {"leftstick", SDL_CONTROLLER_BUTTON_LEFTSTICK},
+    {"rightstick", SDL_CONTROLLER_BUTTON_RIGHTSTICK},
+    {"leftshoulder", SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
+    {"lb", SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
+    {"rightshoulder", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
+    {"rb", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
+    {"dpadup", SDL_CONTROLLER_BUTTON_DPAD_UP},
+    {"dpaddown", SDL_CONTROLLER_BUTTON_DPAD_DOWN},
+    {"dpadleft", SDL_CONTROLLER_BUTTON_DPAD_LEFT},
+    {"dpadright", SDL_CONTROLLER_BUTTON_DPAD_RIGHT},
+    {"share", SDL_CONTROLLER_BUTTON_MISC1},
+    {"misc1", SDL_CONTROLLER_BUTTON_MISC1},
+    {"paddle1", SDL_CONTROLLER_BUTTON_PADDLE1},
+    {"paddle2", SDL_CONTROLLER_BUTTON_PADDLE2},
+    {"paddle3", SDL_CONTROLLER_BUTTON_PADDLE3},
+    {"paddle4", SDL_CONTROLLER_BUTTON_PADDLE4},
+    {"touchpad", SDL_CONTROLLER_BUTTON_TOUCHPAD}
+};
+
+static const size_t g_gamepad_button_count =
+    sizeof(g_gamepad_buttons) / sizeof(g_gamepad_buttons[0]);
+
+static const GamepadAxisName g_gamepad_axes[] = {
+    {"leftx", SDL_CONTROLLER_AXIS_LEFTX},
+    {"lx", SDL_CONTROLLER_AXIS_LEFTX},
+    {"lefty", SDL_CONTROLLER_AXIS_LEFTY},
+    {"ly", SDL_CONTROLLER_AXIS_LEFTY},
+    {"rightx", SDL_CONTROLLER_AXIS_RIGHTX},
+    {"rx", SDL_CONTROLLER_AXIS_RIGHTX},
+    {"righty", SDL_CONTROLLER_AXIS_RIGHTY},
+    {"ry", SDL_CONTROLLER_AXIS_RIGHTY},
+    {"triggerleft", SDL_CONTROLLER_AXIS_TRIGGERLEFT},
+    {"lt", SDL_CONTROLLER_AXIS_TRIGGERLEFT},
+    {"triggerright", SDL_CONTROLLER_AXIS_TRIGGERRIGHT},
+    {"rt", SDL_CONTROLLER_AXIS_TRIGGERRIGHT}
+};
+
+static const size_t g_gamepad_axis_count =
+    sizeof(g_gamepad_axes) / sizeof(g_gamepad_axes[0]);
+
+static void gamepad_reset_states(void);
+static void gamepad_shutdown(void);
+static void gamepad_init(void);
+static void gamepad_handle_event(const SDL_Event *e);
+
 /*
  * 8x8 monochrome bitmap font for ASCII 0..127.
  *
@@ -1127,7 +1207,7 @@ static int parse_scale(lua_State *L, int index)
     return (int)scale;
 }
 
-static int parse_angle(lua_State *L, int index)
+static int parse_angle_named(lua_State *L, int index, const char *name)
 {
     lua_Number n;
     lua_Integer angle;
@@ -1136,18 +1216,23 @@ static int parse_angle(lua_State *L, int index)
         return 0;
 
     n = luaL_checknumber(L, index);
-    if (n < -1000000.0 || n > 1000000.0)
-        return luaL_error(L, "draw.draw: angle is out of range");
+    if (!isfinite(n) || n < -1000000.0 || n > 1000000.0)
+        return luaL_error(L, "%s: angle is out of range", name);
 
     angle = (lua_Integer)n;
     if ((lua_Number)angle != n)
-        return luaL_error(L, "draw.draw: angle must be an integer");
+        return luaL_error(L, "%s: angle must be an integer", name);
 
     angle %= 360;
     if (angle < 0)
         angle += 360;
 
     return (int)angle;
+}
+
+static int parse_angle(lua_State *L, int index)
+{
+    return parse_angle_named(L, index, "draw.draw");
 }
 
 static int parse_flip(lua_State *L, int index, const char *option)
@@ -1417,6 +1502,126 @@ static void fill_rect(long long x, long long y, long long w, long long h,
     if (inner_h > 0) {
         fill_rect(x, y + t, t, inner_h, 0, color);
         fill_rect(x + w - t, y + t, t, inner_h, 0, color);
+    }
+}
+
+static void fill_rotated_rect(double x, double y, double w, double h,
+                              int angle, int fill, uint32_t color)
+{
+    double cx, cy, hw, hh, rad, c, s;
+    double minx, maxx, miny, maxy;
+    long long y0, y1, row;
+    int t;
+
+    if (w <= 0.0 || h <= 0.0)
+        return;
+
+    cx = x + w / 2.0;
+    cy = y + h / 2.0;
+    hw = w / 2.0;
+    hh = h / 2.0;
+    rad = (double)angle * 0.017453292519943295769236907684886;
+    c = cos(rad);
+    s = sin(rad);
+    if (fabs(c) < 1e-12)
+        c = 0.0;
+    if (fabs(s) < 1e-12)
+        s = 0.0;
+
+    minx = maxx = -hw * c - (-hh) * s;
+    miny = maxy = -hw * s + (-hh) * c;
+    {
+        double lx, ly, rx, ry;
+        int k;
+
+        for (k = 0; k < 4; ++k) {
+            lx = (k & 1) ? hw : -hw;
+            ly = (k & 2) ? hh : -hh;
+            rx = lx * c - ly * s;
+            ry = lx * s + ly * c;
+            if (k == 0) {
+                minx = maxx = rx;
+                miny = maxy = ry;
+            } else {
+                if (rx < minx) minx = rx;
+                if (rx > maxx) maxx = rx;
+                if (ry < miny) miny = ry;
+                if (ry > maxy) maxy = ry;
+            }
+        }
+    }
+
+    y0 = (long long)floor(cy + miny) - 1;
+    y1 = (long long)ceil(cy + maxy) + 1;
+    if (y0 < 0) y0 = 0;
+    if (y1 >= g_draw.height) y1 = g_draw.height - 1;
+    if (y0 > y1)
+        return;
+
+    t = 1;
+    if (fill != 0) {
+        t = fill < 0 ? 1 : fill;
+        if ((double)t > (w + 1.0) / 2.0)
+            t = (int)((w + 1.0) / 2.0);
+        if ((double)t > (h + 1.0) / 2.0)
+            t = (int)((h + 1.0) / 2.0);
+        if (t <= 0)
+            return;
+    }
+
+    for (row = y0; row <= y1; ++row) {
+        double dy = (double)row + 0.5 - cy;
+        double lo, hi, a, b;
+        long long x0, x1, col;
+
+        if (fabs(c) > 1e-12) {
+            a = (-hw - dy * s) / c;
+            b = (hw - dy * s) / c;
+            lo = a < b ? a : b;
+            hi = a < b ? b : a;
+        } else {
+            if (fabs(dy * s) > hw)
+                continue;
+            lo = -1e100;
+            hi = 1e100;
+        }
+
+        if (fabs(s) > 1e-12) {
+            double a0 = (dy * c - hh) / s;
+            double b0 = (dy * c + hh) / s;
+
+            a = a0 < b0 ? a0 : b0;
+            b = a0 < b0 ? b0 : a0;
+            if (a > lo) lo = a;
+            if (b < hi) hi = b;
+        } else {
+            if (fabs(dy * c) > hh)
+                continue;
+        }
+        if (lo > hi)
+            continue;
+
+        x0 = (long long)ceil(cx + lo - 0.5 - 1e-9);
+        x1 = (long long)floor(cx + hi - 0.5 + 1e-9);
+        if (x0 < 0) x0 = 0;
+        if (x1 >= g_draw.width) x1 = g_draw.width - 1;
+        if (x0 > x1)
+            continue;
+
+        if (fill == 0) {
+            fill_span(x0, x1, row, color);
+            continue;
+        }
+
+        for (col = x0; col <= x1; ++col) {
+            double dx = (double)col + 0.5 - cx;
+            double lx = dx * c + dy * s;
+            double ly = -dx * s + dy * c;
+
+            if (hw - lx <= (double)t || hw + lx <= (double)t ||
+                hh - ly <= (double)t || hh + ly <= (double)t)
+                fill_span(col, col, row, color);
+        }
     }
 }
 
@@ -1720,6 +1925,7 @@ static void reset_input(void)
     memset(&g_input, 0, sizeof(g_input));
     g_input.last_key = -1;
     g_input.mouse_button = -1;
+    gamepad_reset_states();
 }
 
 static SDL_Scancode find_key_code(lua_State *L, int arg)
@@ -1769,6 +1975,227 @@ static int event_button_index(Uint8 button)
     if (button == SDL_BUTTON_RIGHT)
         return 2;
     return -1;
+}
+
+static void gamepad_clear(GamepadState *pad)
+{
+    if (!pad)
+        return;
+    if (pad->controller) {
+        SDL_GameControllerClose(pad->controller);
+        pad->controller = NULL;
+    }
+    memset(pad, 0, sizeof(*pad));
+    pad->instance = -1;
+    pad->last_button = -1;
+}
+
+static void gamepad_reset_states(void)
+{
+    int i;
+
+    for (i = 0; i < GAMEPAD_SLOTS; ++i) {
+        memset(g_gamepads[i].down, 0, sizeof(g_gamepads[i].down));
+        memset(g_gamepads[i].pressed, 0, sizeof(g_gamepads[i].pressed));
+        memset(g_gamepads[i].axis, 0, sizeof(g_gamepads[i].axis));
+        g_gamepads[i].last_button = -1;
+    }
+}
+
+static int gamepad_slot(lua_State *L, int arg, const char *cmd)
+{
+    lua_Integer index = luaL_optinteger(L, arg, 1);
+
+    if (index < 1 || index > GAMEPAD_SLOTS)
+        return (int)luaL_error(L, "draw.%s: index must be 1..%d",
+                               cmd, GAMEPAD_SLOTS);
+    return (int)index - 1;
+}
+
+static int gamepad_find_button(lua_State *L, int arg, const char *cmd)
+{
+    const char *name = luaL_checkstring(L, arg);
+    size_t i;
+
+    for (i = 0; i < g_gamepad_button_count; ++i) {
+        if (strcmp(g_gamepad_buttons[i].name, name) == 0)
+            return (int)g_gamepad_buttons[i].button;
+    }
+    return (int)luaL_error(L, "draw.%s: unknown button '%s'", cmd, name);
+}
+
+static int gamepad_find_axis(lua_State *L, int arg, const char *cmd)
+{
+    const char *name = luaL_checkstring(L, arg);
+    size_t i;
+
+    for (i = 0; i < g_gamepad_axis_count; ++i) {
+        if (strcmp(g_gamepad_axes[i].name, name) == 0)
+            return (int)g_gamepad_axes[i].axis;
+    }
+    return (int)luaL_error(L, "draw.%s: unknown stick '%s'", cmd, name);
+}
+
+static int gamepad_slot_by_instance(SDL_JoystickID instance)
+{
+    int i;
+
+    for (i = 0; i < GAMEPAD_SLOTS; ++i) {
+        if (!g_gamepads[i].connected || !g_gamepads[i].controller)
+            continue;
+        if (SDL_JoystickInstanceID(
+                SDL_GameControllerGetJoystick(g_gamepads[i].controller)) == instance)
+            return i;
+    }
+    return -1;
+}
+
+static void gamepad_open_device(int device_index)
+{
+    SDL_GameController *controller;
+    SDL_JoystickID instance;
+    const char *name;
+    int duplicate;
+    int slot;
+    int i;
+
+    if (device_index < 0 || !SDL_IsGameController(device_index))
+        return;
+    controller = SDL_GameControllerOpen(device_index);
+    if (!controller)
+        return;
+    instance = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller));
+    if (instance < 0) {
+        SDL_GameControllerClose(controller);
+        return;
+    }
+
+    duplicate = gamepad_slot_by_instance(instance);
+    if (duplicate >= 0) {
+        SDL_GameControllerClose(controller);
+        return;
+    }
+
+    slot = -1;
+    for (i = 0; i < GAMEPAD_SLOTS; ++i) {
+        if (!g_gamepads[i].connected) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        SDL_GameControllerClose(controller);
+        return;
+    }
+
+    gamepad_clear(&g_gamepads[slot]);
+    g_gamepads[slot].controller = controller;
+    g_gamepads[slot].instance = instance;
+    g_gamepads[slot].connected = 1;
+    g_gamepads[slot].last_button = -1;
+    name = SDL_GameControllerName(controller);
+    if (name)
+        snprintf(g_gamepads[slot].name, GAMEPAD_NAME_MAX, "%s", name);
+}
+
+static void gamepad_remove_instance(SDL_JoystickID instance)
+{
+    int slot = gamepad_slot_by_instance(instance);
+
+    if (slot >= 0)
+        gamepad_clear(&g_gamepads[slot]);
+}
+
+static double gamepad_normalize_axis(Sint16 value, int trigger)
+{
+    double normalized;
+
+    if (trigger) {
+        if (value <= 0)
+            return 0.0;
+        normalized = (double)value / 32767.0;
+        return normalized < 0.05 ? 0.0 : normalized;
+    }
+
+    normalized = (double)value / (value < 0 ? 32768.0 : 32767.0);
+    return fabs(normalized) < 0.15 ? 0.0 : normalized;
+}
+
+static void gamepad_set_button(GamepadState *pad, int button, int down)
+{
+    if (!pad || button < 0 || button >= SDL_CONTROLLER_BUTTON_MAX)
+        return;
+    if (down) {
+        pad->down[button] = 1;
+        pad->pressed[button] = 1;
+        pad->last_button = button;
+    } else {
+        pad->down[button] = 0;
+    }
+}
+
+static void gamepad_scan_connected(void)
+{
+    int count = SDL_NumJoysticks();
+    int i;
+
+    for (i = 0; i < count; ++i)
+        gamepad_open_device(i);
+}
+
+static void gamepad_init(void)
+{
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER)) {
+        if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0)
+            return;
+        g_gamecontroller_owned = 1;
+    }
+    SDL_GameControllerEventState(SDL_ENABLE);
+    gamepad_scan_connected();
+}
+
+static void gamepad_shutdown(void)
+{
+    int i;
+
+    for (i = 0; i < GAMEPAD_SLOTS; ++i)
+        gamepad_clear(&g_gamepads[i]);
+    if (g_gamecontroller_owned) {
+        SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
+        g_gamecontroller_owned = 0;
+    }
+}
+
+static void gamepad_handle_event(const SDL_Event *e)
+{
+    int slot;
+    int index;
+
+    if (e->type == SDL_CONTROLLERDEVICEADDED) {
+        gamepad_open_device((int)e->cdevice.which);
+        return;
+    }
+    if (e->type == SDL_CONTROLLERDEVICEREMOVED) {
+        gamepad_remove_instance(e->cdevice.which);
+        return;
+    }
+    if (e->type == SDL_CONTROLLERBUTTONDOWN || e->type == SDL_CONTROLLERBUTTONUP) {
+        slot = gamepad_slot_by_instance(e->cbutton.which);
+        if (slot >= 0)
+            gamepad_set_button(&g_gamepads[slot], (int)e->cbutton.button,
+                               e->type == SDL_CONTROLLERBUTTONDOWN);
+        return;
+    }
+    if (e->type == SDL_CONTROLLERAXISMOTION) {
+        slot = gamepad_slot_by_instance(e->caxis.which);
+        index = (int)e->caxis.axis;
+        if (slot >= 0 && index >= 0 && index < SDL_CONTROLLER_AXIS_MAX) {
+            g_gamepads[slot].axis[index] = gamepad_normalize_axis(
+                e->caxis.value,
+                index == SDL_CONTROLLER_AXIS_TRIGGERLEFT ||
+                index == SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+        }
+    }
 }
 
 static void event_position_to_logical(int win_x, int win_y,
@@ -1847,6 +2274,8 @@ static void snapshot_frame_input(void)
 
 static void handle_event(const SDL_Event *e)
 {
+    gamepad_handle_event(e);
+
     if (e->type == SDL_QUIT) {
         g_draw.open = 0;
         return;
@@ -2878,6 +3307,7 @@ static void destroy_resources(void)
     g_draw.frame_delta = 0.0;
     g_draw.alpha = 255;
 
+    gamepad_shutdown();
     audio_close();
 
     if (g_draw.sdl_owned) {
@@ -2914,6 +3344,8 @@ static int l_open(lua_State *L)
                               SDL_GetError());
         g_draw.sdl_owned = 1;
     }
+
+    gamepad_init();
 
     g_draw.window = SDL_CreateWindow(
         "Lua Draw",
@@ -4393,6 +4825,102 @@ static int l_wheel(lua_State *L)
     return 2;
 }
 
+static int l_gamepadcount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < GAMEPAD_SLOTS; ++i) {
+        if (g_gamepads[i].connected)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static int l_gamepadname(lua_State *L)
+{
+    GamepadState *pad = &g_gamepads[gamepad_slot(L, 1, "gamepadname")];
+
+    if (!pad->connected || pad->name[0] == '\0') {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushstring(L, pad->name);
+    return 1;
+}
+
+static int l_gamepadbutton(lua_State *L)
+{
+    int button = gamepad_find_button(L, 1, "gamepadbutton");
+    GamepadState *pad = &g_gamepads[gamepad_slot(L, 2, "gamepadbutton")];
+
+    lua_pushboolean(L, pad->connected && button >= 0 &&
+                       button < SDL_CONTROLLER_BUTTON_MAX &&
+                       pad->down[button]);
+    return 1;
+}
+
+static int l_gamepadpress(lua_State *L)
+{
+    int button = gamepad_find_button(L, 1, "gamepadpress");
+    GamepadState *pad = &g_gamepads[gamepad_slot(L, 2, "gamepadpress")];
+
+    if (pad->connected && button >= 0 && button < SDL_CONTROLLER_BUTTON_MAX &&
+        pad->pressed[button]) {
+        pad->pressed[button] = 0;
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
+static int l_gamepadstick(lua_State *L)
+{
+    int axis = gamepad_find_axis(L, 1, "gamepadstick");
+    GamepadState *pad = &g_gamepads[gamepad_slot(L, 2, "gamepadstick")];
+    double value = 0.0;
+
+    if (pad->connected && pad->controller && axis >= 0 &&
+        axis < SDL_CONTROLLER_AXIS_MAX) {
+        value = gamepad_normalize_axis(
+            SDL_GameControllerGetAxis(pad->controller,
+                                      (SDL_GameControllerAxis)axis),
+            axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ||
+            axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+    }
+    lua_pushnumber(L, value);
+    return 1;
+}
+
+static int l_gamepadrumble(lua_State *L)
+{
+    lua_Number left = luaL_checknumber(L, 1);
+    lua_Number right = luaL_checknumber(L, 2);
+    lua_Integer duration = luaL_optinteger(L, 3, 200);
+    GamepadState *pad = &g_gamepads[gamepad_slot(L, 4, "gamepadrumble")];
+
+    if (!isfinite(left) || left < 0.0 || left > 1.0)
+        return luaL_error(L, "draw.gamepadrumble: left must be 0..1");
+    if (!isfinite(right) || right < 0.0 || right > 1.0)
+        return luaL_error(L, "draw.gamepadrumble: right must be 0..1");
+    if (duration < 0 || duration > 5000)
+        return luaL_error(L, "draw.gamepadrumble: duration must be 0..5000");
+
+    if (!pad->connected || !pad->controller) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    lua_pushboolean(L, SDL_GameControllerRumble(
+        pad->controller,
+        (Uint16)(left * 65535.0 + 0.5),
+        (Uint16)(right * 65535.0 + 0.5),
+        (Uint32)duration) == 0);
+    return 1;
+}
+
 static int l_line(lua_State *L)
 {
     lua_Integer x1, y1, x2, y2;
@@ -4460,6 +4988,7 @@ static int l_square(lua_State *L)
     lua_Integer x, y, w, h;
     int r, g, b, a;
     int fill;
+    int angle;
 
     if (!ensure_open(L, "draw.square"))
         return 0;
@@ -4478,9 +5007,25 @@ static int l_square(lua_State *L)
     if (read_color(L, 5, &r, &g, &b, &a) < 0)
         return luaL_error(L, "draw.square: expected a color");
     fill = read_fill(L, 5, "draw.square");
+    angle = parse_angle_named(L, 7, "draw.square");
 
-    fill_rect((long long)x, (long long)y, (long long)w, (long long)h,
-              fill, make_color(r, g, b, a));
+    if (angle == 0) {
+        fill_rect((long long)x, (long long)y, (long long)w, (long long)h,
+                  fill, make_color(r, g, b, a));
+        return 0;
+    }
+
+    if (w < 0) {
+        x += w;
+        w = -w;
+    }
+    if (h < 0) {
+        y += h;
+        h = -h;
+    }
+    if (w > 0 && h > 0)
+        fill_rotated_rect((double)x, (double)y, (double)w, (double)h,
+                          angle, fill, make_color(r, g, b, a));
     return 0;
 }
 
@@ -5061,6 +5606,1372 @@ static int l_stop(lua_State *L)
     return 0;
 }
 
+#define COLLISION_COORD_LIMIT 1000000000LL
+#define COLLISION_RADIUS_LIMIT 3037000499LL
+#define COLLISION_POINT_LIMIT 1000000
+#define COLLISION_AREA_LIMIT 4000000LL
+
+typedef enum {
+    COLLISION_POINT = 0,
+    COLLISION_CIRCLE,
+    COLLISION_SQUARE,
+    COLLISION_TRIANGLE,
+    COLLISION_SPRITE
+} CollisionKind;
+
+typedef struct {
+    CollisionKind kind;
+    long long x, y;
+    long long x2, y2;
+    long long x3, y3;
+    long long radius;
+    long long width, height;
+    long long area2;
+    int sprite_index;
+    int scale, angle;
+    int flipx, flipy;
+    int tr, tg, tb, ta;
+    double pivot_x, pivot_y;
+    int pivot_given;
+    double rot_min_x, rot_max_x, rot_min_y, rot_max_y;
+    double px, py, c, s;
+} CollisionShape;
+
+typedef long long CollisionPoint;
+
+typedef struct {
+    CollisionPoint *data;
+    size_t count;
+    size_t cap;
+} PointBuf;
+
+static int collision_abs(int top, int index)
+{
+    return index > 0 ? index : top + index + 1;
+}
+
+static int collision_get_field(lua_State *L, int table, const char *key)
+{
+    lua_pushstring(L, key);
+    lua_rawget(L, table);
+    return lua_gettop(L);
+}
+
+static int collision_table_field(lua_State *L, int table, const char *key)
+{
+    int index = collision_get_field(L, table, key);
+
+    if (!lua_istable(L, index)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    return collision_abs(lua_gettop(L), index);
+}
+
+static long long collision_int_value(lua_State *L, lua_Number n,
+                                     const char *path, long long min,
+                                     long long max)
+{
+    long long value = (long long)n;
+
+    if (!isfinite(n) || (lua_Number)value != n || value < min || value > max)
+        luaL_error(L, "draw.collision: %s must be an integer within range",
+                   path);
+    return value;
+}
+
+static long long collision_req_int(lua_State *L, int table, const char *key,
+                                   const char *path, long long min,
+                                   long long max)
+{
+    int index = collision_get_field(L, table, key);
+    long long value;
+
+    if (!lua_isnumber(L, index))
+        luaL_error(L, "draw.collision: %s must be a number", path);
+    value = collision_int_value(L, lua_tonumber(L, index), path, min, max);
+    lua_pop(L, 1);
+    return value;
+}
+
+static long long collision_opt_int(lua_State *L, int table, const char *key,
+                                   long long default_value, const char *path,
+                                   long long min, long long max)
+{
+    int index = collision_get_field(L, table, key);
+    long long value = default_value;
+
+    if (!lua_isnil(L, index))
+        value = collision_int_value(L, lua_tonumber(L, index), path, min, max);
+    lua_pop(L, 1);
+    return value;
+}
+
+static int collision_opt_bool(lua_State *L, int table, const char *key,
+                              const char *path)
+{
+    int index = collision_get_field(L, table, key);
+    int value = 0;
+
+    if (!lua_isnil(L, index)) {
+        if (!lua_isboolean(L, index))
+            luaL_error(L, "draw.collision: %s must be true or false", path);
+        value = lua_toboolean(L, index);
+    }
+    lua_pop(L, 1);
+    return value;
+}
+
+static int collision_opt_index_bool(lua_State *L, int table, int key,
+                                    const char *path)
+{
+    lua_pushinteger(L, key);
+    lua_rawget(L, table);
+    {
+        int index = lua_gettop(L);
+        int value = 0;
+
+        if (!lua_isnil(L, index)) {
+            if (!lua_isboolean(L, index))
+                luaL_error(L, "draw.collision: %s must be true or false", path);
+            value = lua_toboolean(L, index);
+        }
+        lua_pop(L, 1);
+        return value;
+    }
+}
+
+static double collision_opt_index_double(lua_State *L, int table, int key,
+                                         double default_value,
+                                         const char *path)
+{
+    lua_pushinteger(L, key);
+    lua_rawget(L, table);
+    {
+        int index = lua_gettop(L);
+        double value = default_value;
+
+        if (!lua_isnil(L, index)) {
+            if (!lua_isnumber(L, index))
+                luaL_error(L, "draw.collision: %s must be a number", path);
+            value = (double)lua_tonumber(L, index);
+            if (!isfinite(value))
+                luaL_error(L, "draw.collision: %s must be finite", path);
+        }
+        lua_pop(L, 1);
+        return value;
+    }
+}
+
+static const char *collision_req_string(lua_State *L, int table,
+                                        const char *key, const char *path)
+{
+    int index = collision_get_field(L, table, key);
+    const char *value;
+
+    if (lua_type(L, index) != LUA_TSTRING)
+        luaL_error(L, "draw.collision: %s must be a string", path);
+    value = lua_tostring(L, index);
+    lua_pop(L, 1);
+    return value;
+}
+
+static int collision_sprite_index(lua_State *L, const char *name)
+{
+    int index = find_sprite_name(name);
+
+    if (index < 0) {
+        int ai = find_anim_name(name);
+
+        if (ai >= 0 && g_anims[ai].count > 0) {
+            Uint32 now = SDL_GetTicks();
+            double elapsed = (double)(now - g_anims[ai].started) / 1000.0;
+            int frame = (int)(elapsed * g_anims[ai].fps) % g_anims[ai].count;
+
+            name = g_anims[ai].frames[frame];
+            index = find_sprite_name(name);
+        }
+    }
+    if (index < 0)
+        luaL_error(L, "draw.collision: sprite or animation '%s' is not defined",
+                   name);
+    return index;
+}
+
+static void collision_read_tint(lua_State *L, int table, int *r, int *g,
+                                int *b, int *a)
+{
+    int index = collision_get_field(L, table, "tint");
+
+    if (lua_isnil(L, index)) {
+        *r = 255;
+        *g = 255;
+        *b = 255;
+        *a = 255;
+        lua_pop(L, 1);
+        return;
+    }
+    read_color(L, index, r, g, b, a);
+    lua_pop(L, 1);
+}
+
+static void collision_sprite_geometry(CollisionShape *out)
+{
+    const SpriteEntry *sprite = &g_sprites[out->sprite_index];
+    double W, H, rad;
+    int k;
+
+    out->px = out->pivot_x * (double)out->scale;
+    out->py = out->pivot_y * (double)out->scale;
+    W = (double)sprite->width * (double)out->scale;
+    H = (double)sprite->height * (double)out->scale;
+    rad = (double)out->angle * 0.017453292519943295769236907684886;
+    out->c = cos(rad);
+    out->s = sin(rad);
+    if (fabs(out->c) < 1e-12)
+        out->c = 0.0;
+    if (fabs(out->s) < 1e-12)
+        out->s = 0.0;
+
+    for (k = 0; k < 4; ++k) {
+        double vx = (k & 1) ? W - out->px : -out->px;
+        double vy = (k & 2) ? H - out->py : -out->py;
+        double rx = vx * out->c - vy * out->s;
+        double ry = vx * out->s + vy * out->c;
+
+        if (k == 0) {
+            out->rot_min_x = out->rot_max_x = rx;
+            out->rot_min_y = out->rot_max_y = ry;
+        } else {
+            if (rx < out->rot_min_x) out->rot_min_x = rx;
+            if (rx > out->rot_max_x) out->rot_max_x = rx;
+            if (ry < out->rot_min_y) out->rot_min_y = ry;
+            if (ry > out->rot_max_y) out->rot_max_y = ry;
+        }
+    }
+}
+
+static void collision_parse_sprite(lua_State *L, int table, CollisionShape *out)
+{
+    const char *name;
+    SpriteEntry *sprite;
+    int pivot_table;
+    int flip_table;
+    int angle;
+    int scale;
+    size_t i;
+    size_t count;
+    double pivot_x, pivot_y;
+
+    name = collision_req_string(L, table, "sprite", "a.sprite.name");
+    out->x = collision_req_int(L, table, "x", "a.sprite.x",
+                               -COLLISION_COORD_LIMIT, COLLISION_COORD_LIMIT);
+    out->y = collision_req_int(L, table, "y", "a.sprite.y",
+                               -COLLISION_COORD_LIMIT, COLLISION_COORD_LIMIT);
+    scale = (int)collision_opt_int(L, table, "scale", 1, "a.sprite.scale",
+                                   1, SPRITE_SCALE_MAX);
+    angle = (int)collision_opt_int(L, table, "angle", 0, "a.sprite.angle",
+                                   -1000000, 1000000);
+    angle %= 360;
+    if (angle < 0)
+        angle += 360;
+    out->scale = scale;
+    out->angle = angle;
+
+    flip_table = collision_table_field(L, table, "flip");
+    if (flip_table) {
+        out->flipx = collision_opt_index_bool(L, flip_table, 1,
+                                              "a.sprite.flip[1]");
+        out->flipy = collision_opt_index_bool(L, flip_table, 2,
+                                              "a.sprite.flip[2]");
+        lua_pop(L, 1);
+    } else {
+        out->flipx = collision_opt_bool(L, table, "flipx", "a.sprite.flipx");
+        out->flipy = collision_opt_bool(L, table, "flipy", "a.sprite.flipy");
+    }
+    collision_read_tint(L, table, &out->tr, &out->tg, &out->tb, &out->ta);
+
+    out->sprite_index = collision_sprite_index(L, name);
+    sprite = &g_sprites[out->sprite_index];
+    count = (size_t)sprite->width * (size_t)sprite->height;
+    for (i = 0; i < count; ++i) {
+        int value = sprite->pixels[i];
+
+        if (value >= 0 &&
+            (value >= g_palette_count || !g_palette[value].used))
+            luaL_error(L, "draw.collision: palette index %d is not defined",
+                       value);
+    }
+
+    pivot_table = collision_table_field(L, table, "pivot");
+    out->pivot_given = pivot_table != 0;
+    pivot_x = (double)sprite->width / 2.0;
+    pivot_y = (double)sprite->height / 2.0;
+    if (pivot_table) {
+        pivot_x = collision_opt_index_double(L, pivot_table, 1, pivot_x,
+                                             "a.sprite.pivot[1]");
+        pivot_y = collision_opt_index_double(L, pivot_table, 2, pivot_y,
+                                             "a.sprite.pivot[2]");
+        lua_pop(L, 1);
+    }
+    if (!isfinite(pivot_x) || !isfinite(pivot_y) || pivot_x < -1000000.0 ||
+        pivot_x > 1000000.0 || pivot_y < -1000000.0 || pivot_y > 1000000.0)
+        luaL_error(L,
+                   "draw.collision: pivot must be finite and within +/-1000000");
+    if (out->flipx)
+        pivot_x = (double)sprite->width - pivot_x;
+    if (out->flipy)
+        pivot_y = (double)sprite->height - pivot_y;
+    out->pivot_x = pivot_x;
+    out->pivot_y = pivot_y;
+    collision_sprite_geometry(out);
+}
+
+static int collision_parse_shape(lua_State *L, int index, CollisionShape *out)
+{
+    int table;
+    int sub;
+
+    memset(out, 0, sizeof(*out));
+    table = collision_abs(lua_gettop(L), index);
+    if (!lua_istable(L, table))
+        return luaL_error(L, "draw.collision: arguments must be tables");
+
+    sub = collision_table_field(L, table, "sprite");
+    if (lua_type(L, collision_get_field(L, table, "sprite")) == LUA_TSTRING) {
+        lua_pop(L, 1);
+        out->kind = COLLISION_SPRITE;
+        collision_parse_sprite(L, table, out);
+        return 0;
+    }
+    lua_pop(L, 1);
+    if (sub) {
+        lua_pop(L, 1);
+        out->kind = COLLISION_SPRITE;
+        collision_parse_sprite(L, sub, out);
+        return 0;
+    }
+
+    sub = collision_table_field(L, table, "point");
+    if (sub) {
+        out->kind = COLLISION_POINT;
+        out->x = collision_req_int(L, sub, "x", "a.point.x",
+                                   -COLLISION_COORD_LIMIT,
+                                   COLLISION_COORD_LIMIT);
+        out->y = collision_req_int(L, sub, "y", "a.point.y",
+                                   -COLLISION_COORD_LIMIT,
+                                   COLLISION_COORD_LIMIT);
+        lua_pop(L, 1);
+        return 0;
+    }
+
+    sub = collision_table_field(L, table, "circle");
+    if (sub) {
+        out->kind = COLLISION_CIRCLE;
+        out->x = collision_req_int(L, sub, "x", "a.circle.x",
+                                   -COLLISION_COORD_LIMIT,
+                                   COLLISION_COORD_LIMIT);
+        out->y = collision_req_int(L, sub, "y", "a.circle.y",
+                                   -COLLISION_COORD_LIMIT,
+                                   COLLISION_COORD_LIMIT);
+        out->radius = collision_req_int(L, sub, "radius", "a.circle.radius",
+                                        0, COLLISION_RADIUS_LIMIT);
+        lua_pop(L, 1);
+        return 0;
+    }
+
+    sub = collision_table_field(L, table, "square");
+    if (sub) {
+        long long raw_angle;
+        double rad;
+
+        out->kind = COLLISION_SQUARE;
+        out->x = collision_req_int(L, sub, "x", "a.square.x",
+                                   -COLLISION_COORD_LIMIT,
+                                   COLLISION_COORD_LIMIT);
+        out->y = collision_req_int(L, sub, "y", "a.square.y",
+                                   -COLLISION_COORD_LIMIT,
+                                   COLLISION_COORD_LIMIT);
+        out->width = collision_req_int(L, sub, "width", "a.square.width",
+                                       0, COLLISION_COORD_LIMIT);
+        out->height = collision_req_int(L, sub, "height", "a.square.height",
+                                        0, COLLISION_COORD_LIMIT);
+        raw_angle = collision_opt_int(L, sub, "angle", 0, "a.square.angle",
+                                      -1000000, 1000000);
+        raw_angle %= 360;
+        if (raw_angle < 0)
+            raw_angle += 360;
+        out->angle = (int)raw_angle;
+        rad = (double)out->angle * 0.017453292519943295769236907684886;
+        out->c = cos(rad);
+        out->s = sin(rad);
+        if (fabs(out->c) < 1e-12)
+            out->c = 0.0;
+        if (fabs(out->s) < 1e-12)
+            out->s = 0.0;
+        lua_pop(L, 1);
+        return 0;
+    }
+
+    sub = collision_table_field(L, table, "triangle");
+    if (sub) {
+        out->kind = COLLISION_TRIANGLE;
+        out->x = collision_req_int(L, sub, "x1", "a.triangle.x1",
+                                   -TRIANGLE_COORD_LIMIT, TRIANGLE_COORD_LIMIT);
+        out->y = collision_req_int(L, sub, "y1", "a.triangle.y1",
+                                   -TRIANGLE_COORD_LIMIT, TRIANGLE_COORD_LIMIT);
+        out->x2 = collision_req_int(L, sub, "x2", "a.triangle.x2",
+                                    -TRIANGLE_COORD_LIMIT, TRIANGLE_COORD_LIMIT);
+        out->y2 = collision_req_int(L, sub, "y2", "a.triangle.y2",
+                                    -TRIANGLE_COORD_LIMIT, TRIANGLE_COORD_LIMIT);
+        out->x3 = collision_req_int(L, sub, "x3", "a.triangle.x3",
+                                    -TRIANGLE_COORD_LIMIT, TRIANGLE_COORD_LIMIT);
+        out->y3 = collision_req_int(L, sub, "y3", "a.triangle.y3",
+                                    -TRIANGLE_COORD_LIMIT, TRIANGLE_COORD_LIMIT);
+        out->area2 = (out->x2 - out->x) * (out->y3 - out->y) -
+                     (out->y2 - out->y) * (out->x3 - out->x);
+        lua_pop(L, 1);
+        return 0;
+    }
+
+    return luaL_error(L,
+        "draw.collision: expected sprite, point, circle, square, or triangle");
+}
+
+static void collision_bbox(const CollisionShape *shape, long long *x0,
+                           long long *y0, long long *x1, long long *y1)
+{
+    long long minx, miny, maxx, maxy;
+
+    switch (shape->kind) {
+    case COLLISION_POINT:
+        minx = maxx = shape->x;
+        miny = maxy = shape->y;
+        break;
+    case COLLISION_CIRCLE:
+        minx = shape->x - shape->radius;
+        maxx = shape->x + shape->radius;
+        miny = shape->y - shape->radius;
+        maxy = shape->y + shape->radius;
+        break;
+    case COLLISION_SQUARE:
+        if (shape->angle == 0) {
+            minx = shape->x;
+            maxx = shape->x + shape->width - 1;
+            miny = shape->y;
+            maxy = shape->y + shape->height - 1;
+        } else {
+            double cx = (double)shape->x + (double)shape->width / 2.0;
+            double cy = (double)shape->y + (double)shape->height / 2.0;
+            double hw = (double)shape->width / 2.0;
+            double hh = (double)shape->height / 2.0;
+            double lox, loy, rx, ry;
+            int k;
+
+            minx = maxx = 0.0;
+            miny = maxy = 0.0;
+            for (k = 0; k < 4; ++k) {
+                lox = (k & 1) ? hw : -hw;
+                loy = (k & 2) ? hh : -hh;
+                rx = lox * shape->c - loy * shape->s;
+                ry = lox * shape->s + loy * shape->c;
+                if (k == 0) {
+                    minx = maxx = rx;
+                    miny = maxy = ry;
+                } else {
+                    if (rx < minx) minx = rx;
+                    if (rx > maxx) maxx = rx;
+                    if (ry < miny) miny = ry;
+                    if (ry > maxy) maxy = ry;
+                }
+            }
+            minx = (long long)floor(cx + minx) - 1;
+            maxx = (long long)ceil(cx + maxx) + 1;
+            miny = (long long)floor(cy + miny) - 1;
+            maxy = (long long)ceil(cy + maxy) + 1;
+        }
+        break;
+    case COLLISION_TRIANGLE:
+        minx = shape->x;
+        maxx = shape->x;
+        if (shape->x2 < minx) minx = shape->x2;
+        if (shape->x2 > maxx) maxx = shape->x2;
+        if (shape->x3 < minx) minx = shape->x3;
+        if (shape->x3 > maxx) maxx = shape->x3;
+        miny = shape->y;
+        maxy = shape->y;
+        if (shape->y2 < miny) miny = shape->y2;
+        if (shape->y2 > maxy) maxy = shape->y2;
+        if (shape->y3 < miny) miny = shape->y3;
+        if (shape->y3 > maxy) maxy = shape->y3;
+        break;
+    default:
+        minx = (long long)floor((double)shape->x +
+                                (shape->pivot_given ? shape->rot_min_x : 0.0)) - 1;
+        maxx = (long long)ceil((double)shape->x +
+                               (shape->pivot_given
+                                    ? shape->rot_max_x
+                                    : shape->rot_max_x - shape->rot_min_x)) + 1;
+        miny = (long long)floor((double)shape->y +
+                                (shape->pivot_given ? shape->rot_min_y : 0.0)) - 1;
+        maxy = (long long)ceil((double)shape->y +
+                               (shape->pivot_given
+                                    ? shape->rot_max_y
+                                    : shape->rot_max_y - shape->rot_min_y)) + 1;
+        break;
+    }
+
+    *x0 = minx;
+    *y0 = miny;
+    *x1 = maxx;
+    *y1 = maxy;
+}
+
+static int collision_shape_contains(const CollisionShape *shape,
+                                    long long x, long long y)
+{
+    long long px2, py2, e1, e2, e3;
+
+    switch (shape->kind) {
+    case COLLISION_POINT:
+        return x == shape->x && y == shape->y;
+    case COLLISION_CIRCLE: {
+        __int128 dx = (__int128)x - (__int128)shape->x;
+        __int128 dy = (__int128)y - (__int128)shape->y;
+        __int128 r = (__int128)shape->radius;
+        return dx * dx + dy * dy <= r * r;
+    }
+    case COLLISION_SQUARE:
+        if (shape->angle == 0)
+            return x >= shape->x && x < shape->x + shape->width &&
+                   y >= shape->y && y < shape->y + shape->height;
+        else {
+            double cx = (double)shape->x + (double)shape->width / 2.0;
+            double cy = (double)shape->y + (double)shape->height / 2.0;
+            double hw = (double)shape->width / 2.0;
+            double hh = (double)shape->height / 2.0;
+            double dx = (double)x + 0.5 - cx;
+            double dy = (double)y + 0.5 - cy;
+            double lx = dx * shape->c + dy * shape->s;
+            double ly = -dx * shape->s + dy * shape->c;
+
+            return fabs(lx) <= hw && fabs(ly) <= hh;
+        }
+    case COLLISION_TRIANGLE:
+        if (shape->area2 == 0)
+            return 0;
+        px2 = 2 * x + 1;
+        py2 = 2 * y + 1;
+        e1 = triangle_edge(shape->x, shape->y, shape->x2, shape->y2, px2, py2);
+        e2 = triangle_edge(shape->x2, shape->y2, shape->x3, shape->y3, px2, py2);
+        e3 = triangle_edge(shape->x3, shape->y3, shape->x, shape->y, px2, py2);
+        return shape->area2 > 0
+                   ? (e1 >= 0 && e2 >= 0 && e3 >= 0)
+                   : (e1 <= 0 && e2 <= 0 && e3 <= 0);
+    default:
+        return 0;
+    }
+}
+
+static int collision_area_ok(lua_State *L, long long width, long long height)
+{
+    if (width <= 0 || height <= 0)
+        return 0;
+    if (width > COLLISION_AREA_LIMIT || height > COLLISION_AREA_LIMIT ||
+        width * height > COLLISION_AREA_LIMIT)
+        return luaL_error(L, "draw.collision: intersection area is too large");
+    return 1;
+}
+
+static int collision_intersection(lua_State *L, const CollisionShape *a,
+                                  const CollisionShape *b, long long *x0,
+                                  long long *y0, long long *x1, long long *y1)
+{
+    long long ax0, ay0, ax1, ay1;
+    long long bx0, by0, bx1, by1;
+
+    collision_bbox(a, &ax0, &ay0, &ax1, &ay1);
+    collision_bbox(b, &bx0, &by0, &bx1, &by1);
+    *x0 = ax0 > bx0 ? ax0 : bx0;
+    *y0 = ay0 > by0 ? ay0 : by0;
+    *x1 = ax1 < bx1 ? ax1 : bx1;
+    *y1 = ay1 < by1 ? ay1 : by1;
+    if (!collision_area_ok(L, *x1 - *x0 + 1, *y1 - *y0 + 1))
+        return 0;
+    return 1;
+}
+
+static CollisionPoint collision_point_key(long long x, long long y)
+{
+    return (long long)(((uint64_t)(uint32_t)(int32_t)x << 32) |
+                       (uint32_t)(int32_t)y);
+}
+
+static long long collision_key_x(CollisionPoint key)
+{
+    return (long long)(int32_t)(uint32_t)((uint64_t)key >> 32);
+}
+
+static long long collision_key_y(CollisionPoint key)
+{
+    return (long long)(int32_t)(uint32_t)key;
+}
+
+static int collision_point_cmp(long long ax, long long ay, long long bx,
+                               long long by)
+{
+    if (ax < bx) return -1;
+    if (ax > bx) return 1;
+    if (ay < by) return -1;
+    if (ay > by) return 1;
+    return 0;
+}
+
+static int collision_point_qcmp(const void *pa, const void *pb)
+{
+    CollisionPoint a = *(const CollisionPoint *)pa;
+    CollisionPoint b = *(const CollisionPoint *)pb;
+
+    return collision_point_cmp(collision_key_x(a), collision_key_y(a),
+                               collision_key_x(b), collision_key_y(b));
+}
+
+static int collision_point_lookup(const PointBuf *buf, long long x, long long y)
+{
+    size_t lo = 0;
+    size_t hi = buf->count;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = collision_point_cmp(collision_key_x(buf->data[mid]),
+                                      collision_key_y(buf->data[mid]), x, y);
+
+        if (cmp == 0)
+            return 1;
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return 0;
+}
+
+static int collision_buf_init(PointBuf *buf)
+{
+    buf->data = (CollisionPoint *)malloc(1024 * sizeof(CollisionPoint));
+    buf->count = 0;
+    buf->cap = buf->data ? 1024 : 0;
+    return buf->data ? 0 : -1;
+}
+
+static int collision_buf_push(PointBuf *buf, long long x, long long y)
+{
+    CollisionPoint *data;
+
+    if (buf->count >= COLLISION_POINT_LIMIT)
+        return -1;
+    if (buf->count == buf->cap) {
+        size_t cap = buf->cap ? buf->cap * 2 : 1024;
+
+        if (cap > COLLISION_POINT_LIMIT)
+            cap = COLLISION_POINT_LIMIT;
+        data = (CollisionPoint *)realloc(buf->data,
+                                         cap * sizeof(CollisionPoint));
+        if (!data)
+            return -2;
+        buf->data = data;
+        buf->cap = cap;
+    }
+    buf->data[buf->count++] = collision_point_key(x, y);
+    return 0;
+}
+
+static int collision_rasterize_sprite(const CollisionShape *shape,
+                                      long long clip_x0, long long clip_y0,
+                                      long long clip_x1, long long clip_y1,
+                                      PointBuf *buf)
+{
+    const SpriteEntry *sprite = &g_sprites[shape->sprite_index];
+    long long sx0, sx1, sy0, sy1, sx, sy;
+    double W, H;
+    double base_x, base_y;
+    double span_x, span_y;
+    int global_alpha = g_draw.initialized ? g_draw.alpha : 255;
+
+    W = (double)sprite->width * (double)shape->scale;
+    H = (double)sprite->height * (double)shape->scale;
+    base_x = (double)shape->x +
+             (shape->pivot_given ? shape->rot_min_x : 0.0);
+    base_y = (double)shape->y +
+             (shape->pivot_given ? shape->rot_min_y : 0.0);
+    span_x = shape->rot_max_x - shape->rot_min_x;
+    span_y = shape->rot_max_y - shape->rot_min_y;
+    sx0 = (long long)ceil(base_x);
+    sx1 = (long long)floor(base_x + span_x - 1.0);
+    sy0 = (long long)ceil(base_y);
+    sy1 = (long long)floor(base_y + span_y - 1.0);
+    if (sx0 < clip_x0) sx0 = clip_x0;
+    if (sy0 < clip_y0) sy0 = clip_y0;
+    if (sx1 > clip_x1) sx1 = clip_x1;
+    if (sy1 > clip_y1) sy1 = clip_y1;
+    if (sx0 > sx1 || sy0 > sy1)
+        return 0;
+
+    for (sy = sy0; sy <= sy1; ++sy) {
+        double dy = (double)sy + 0.5 - (double)shape->y;
+
+        if (!shape->pivot_given)
+            dy += shape->rot_min_y;
+        for (sx = sx0; sx <= sx1; ++sx) {
+            double dx = (double)sx + 0.5 - (double)shape->x;
+            double src_cx, src_cy, p, q;
+            int col, row, value, alpha;
+            int rc;
+
+            if (!shape->pivot_given)
+                dx += shape->rot_min_x;
+            src_cx = dx * shape->c + dy * shape->s;
+            src_cy = -dx * shape->s + dy * shape->c;
+            p = src_cx + shape->px;
+            q = src_cy + shape->py;
+            if (p < 0.0 || p >= W || q < 0.0 || q >= H)
+                continue;
+
+            col = (int)floor(p / (double)shape->scale + 1e-9);
+            row = (int)floor(q / (double)shape->scale + 1e-9);
+            if (shape->flipx)
+                col = sprite->width - 1 - col;
+            if (shape->flipy)
+                row = sprite->height - 1 - row;
+            if (col < 0 || col >= sprite->width || row < 0 ||
+                row >= sprite->height)
+                continue;
+
+            value = sprite->pixels[(size_t)row * sprite->width + col];
+            if (value < 0)
+                continue;
+            alpha = (g_palette[value].a * shape->ta) / 255;
+            alpha = (alpha * global_alpha) / 255;
+            if (alpha <= 0)
+                continue;
+
+            rc = collision_buf_push(buf, sx, sy);
+            if (rc != 0)
+                return rc;
+        }
+    }
+    return 0;
+}
+
+static int collision_raster_error(lua_State *L, int code)
+{
+    if (code == -2)
+        return luaL_error(L, "draw.collision: out of memory");
+    return luaL_error(L, "draw.collision: too many opaque pixels");
+}
+
+static int collision_prepare_sprite_points(lua_State *L,
+                                           const CollisionShape *sprite,
+                                           const CollisionShape *other,
+                                           PointBuf *buf)
+{
+    long long x0, y0, x1, y1;
+    int rc;
+
+    buf->data = NULL;
+    buf->count = 0;
+    buf->cap = 0;
+    if (!collision_intersection(L, sprite, other, &x0, &y0, &x1, &y1))
+        return -3;
+    if (collision_buf_init(buf) != 0)
+        return -2;
+    rc = collision_rasterize_sprite(sprite, x0, y0, x1, y1, buf);
+    if (rc != 0) {
+        free(buf->data);
+        buf->data = NULL;
+        buf->count = 0;
+        buf->cap = 0;
+        return rc;
+    }
+    return 0;
+}
+
+static int collision_shapes_overlap(lua_State *L, const CollisionShape *a,
+                                    const CollisionShape *b)
+{
+    long long x0, y0, x1, y1, x, y;
+
+    if (!collision_intersection(L, a, b, &x0, &y0, &x1, &y1))
+        return 0;
+    for (y = y0; y <= y1; ++y) {
+        for (x = x0; x <= x1; ++x) {
+            if (collision_shape_contains(a, x, y) &&
+                collision_shape_contains(b, x, y))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static void collision_buf_free(PointBuf *buf)
+{
+    free(buf->data);
+    buf->data = NULL;
+    buf->count = 0;
+    buf->cap = 0;
+}
+
+static int collision_common_points(lua_State *L, const CollisionShape *a,
+                                   const CollisionShape *b, PointBuf *out)
+{
+    long long x0, y0, x1, y1, x, y;
+    PointBuf tmp;
+    size_t i;
+    int rc;
+
+    out->data = NULL;
+    out->count = 0;
+    out->cap = 0;
+
+    if (a->kind == COLLISION_SPRITE && b->kind == COLLISION_SPRITE) {
+        PointBuf ba;
+        PointBuf bb;
+
+        rc = collision_prepare_sprite_points(L, a, b, &ba);
+        if (rc == -3)
+            return -3;
+        if (rc != 0)
+            return rc;
+        rc = collision_prepare_sprite_points(L, b, a, &bb);
+        if (rc == -3) {
+            collision_buf_free(&ba);
+            return -3;
+        }
+        if (rc != 0) {
+            collision_buf_free(&ba);
+            return rc;
+        }
+
+        rc = collision_buf_init(out);
+        if (rc != 0) {
+            collision_buf_free(&ba);
+            collision_buf_free(&bb);
+            return -2;
+        }
+        qsort(bb.data, bb.count, sizeof(CollisionPoint), collision_point_qcmp);
+        for (i = 0; i < ba.count; ++i) {
+            if (collision_point_lookup(&bb, collision_key_x(ba.data[i]),
+                                       collision_key_y(ba.data[i]))) {
+                rc = collision_buf_push(out, collision_key_x(ba.data[i]),
+                                        collision_key_y(ba.data[i]));
+                if (rc != 0) {
+                    collision_buf_free(&ba);
+                    collision_buf_free(&bb);
+                    collision_buf_free(out);
+                    return rc;
+                }
+            }
+        }
+        collision_buf_free(&ba);
+        collision_buf_free(&bb);
+        return 0;
+    }
+
+    if (a->kind == COLLISION_SPRITE || b->kind == COLLISION_SPRITE) {
+        const CollisionShape *sprite = a->kind == COLLISION_SPRITE ? a : b;
+        const CollisionShape *shape = a->kind == COLLISION_SPRITE ? b : a;
+
+        rc = collision_prepare_sprite_points(L, sprite, shape, &tmp);
+        if (rc == -3)
+            return -3;
+        if (rc != 0)
+            return rc;
+        rc = collision_buf_init(out);
+        if (rc != 0) {
+            collision_buf_free(&tmp);
+            return -2;
+        }
+        for (i = 0; i < tmp.count; ++i) {
+            x = collision_key_x(tmp.data[i]);
+            y = collision_key_y(tmp.data[i]);
+            if (collision_shape_contains(shape, x, y)) {
+                rc = collision_buf_push(out, x, y);
+                if (rc != 0) {
+                    collision_buf_free(&tmp);
+                    collision_buf_free(out);
+                    return rc;
+                }
+            }
+        }
+        collision_buf_free(&tmp);
+        return 0;
+    }
+
+    if (!collision_intersection(L, a, b, &x0, &y0, &x1, &y1))
+        return -3;
+    rc = collision_buf_init(out);
+    if (rc != 0)
+        return -2;
+    for (y = y0; y <= y1; ++y) {
+        for (x = x0; x <= x1; ++x) {
+            if (collision_shape_contains(a, x, y) &&
+                collision_shape_contains(b, x, y)) {
+                rc = collision_buf_push(out, x, y);
+                if (rc != 0) {
+                    collision_buf_free(out);
+                    return rc;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static long long collision_round_ll(double v)
+{
+    return v >= 0.0 ? (long long)floor(v + 0.5) : (long long)ceil(v - 0.5);
+}
+
+static int collision_lerp_angle(int from, int to, double t)
+{
+    double delta = (double)to - (double)from;
+    long long value;
+
+    if (delta > 180.0)
+        delta -= 360.0;
+    if (delta < -180.0)
+        delta += 360.0;
+    value = collision_round_ll((double)from + delta * t) % 360;
+    if (value < 0)
+        value += 360;
+    return (int)value;
+}
+
+static void collision_interpolate(const CollisionShape *from,
+                                  const CollisionShape *to, double t,
+                                  CollisionShape *out)
+{
+    double rad;
+
+    *out = *to;
+    out->x = collision_round_ll((double)from->x +
+                                ((double)to->x - (double)from->x) * t);
+    out->y = collision_round_ll((double)from->y +
+                                ((double)to->y - (double)from->y) * t);
+
+    switch (to->kind) {
+    case COLLISION_CIRCLE:
+        out->radius = collision_round_ll(
+            (double)from->radius + ((double)to->radius - (double)from->radius) * t);
+        break;
+    case COLLISION_SQUARE:
+        out->width = collision_round_ll(
+            (double)from->width + ((double)to->width - (double)from->width) * t);
+        out->height = collision_round_ll(
+            (double)from->height + ((double)to->height - (double)from->height) * t);
+        out->angle = collision_lerp_angle(from->angle, to->angle, t);
+        rad = (double)out->angle * 0.017453292519943295769236907684886;
+        out->c = cos(rad);
+        out->s = sin(rad);
+        if (fabs(out->c) < 1e-12)
+            out->c = 0.0;
+        if (fabs(out->s) < 1e-12)
+            out->s = 0.0;
+        break;
+    case COLLISION_TRIANGLE:
+        out->x2 = collision_round_ll((double)from->x2 +
+                                     ((double)to->x2 - (double)from->x2) * t);
+        out->y2 = collision_round_ll((double)from->y2 +
+                                     ((double)to->y2 - (double)from->y2) * t);
+        out->x3 = collision_round_ll((double)from->x3 +
+                                     ((double)to->x3 - (double)from->x3) * t);
+        out->y3 = collision_round_ll((double)from->y3 +
+                                     ((double)to->y3 - (double)from->y3) * t);
+        out->area2 = (out->x2 - out->x) * (out->y3 - out->y) -
+                     (out->y2 - out->y) * (out->x3 - out->x);
+        break;
+    case COLLISION_SPRITE:
+        out->angle = collision_lerp_angle(from->angle, to->angle, t);
+        out->pivot_x = from->pivot_x + (to->pivot_x - from->pivot_x) * t;
+        out->pivot_y = from->pivot_y + (to->pivot_y - from->pivot_y) * t;
+        collision_sprite_geometry(out);
+        break;
+    default:
+        break;
+    }
+}
+
+static int collision_same_kind(const CollisionShape *a,
+                               const CollisionShape *b)
+{
+    if (a->kind != b->kind)
+        return 0;
+    if (a->kind == COLLISION_SPRITE && a->sprite_index != b->sprite_index)
+        return 0;
+    return 1;
+}
+
+static int collision_overlap_at(lua_State *L, const CollisionShape *a,
+                                const CollisionShape *b)
+{
+    PointBuf buf;
+    int rc;
+    int hit;
+
+    rc = collision_common_points(L, a, b, &buf);
+    if (rc == -3)
+        return 0;
+    if (rc != 0) {
+        collision_buf_free(&buf);
+        collision_raster_error(L, rc);
+        return 0;
+    }
+    hit = buf.count > 0;
+    collision_buf_free(&buf);
+    return hit;
+}
+
+static void collision_centroid(const PointBuf *buf, double *cx, double *cy)
+{
+    double sx = 0.0;
+    double sy = 0.0;
+    size_t i;
+
+    for (i = 0; i < buf->count; ++i) {
+        sx += (double)collision_key_x(buf->data[i]);
+        sy += (double)collision_key_y(buf->data[i]);
+    }
+    *cx = buf->count ? sx / (double)buf->count : 0.0;
+    *cy = buf->count ? sy / (double)buf->count : 0.0;
+}
+
+static void collision_shape_center(const CollisionShape *shape,
+                                   double *cx, double *cy)
+{
+    switch (shape->kind) {
+    case COLLISION_POINT:
+    case COLLISION_CIRCLE:
+        *cx = (double)shape->x;
+        *cy = (double)shape->y;
+        break;
+    case COLLISION_SQUARE:
+        *cx = (double)shape->x + (double)shape->width / 2.0;
+        *cy = (double)shape->y + (double)shape->height / 2.0;
+        break;
+    case COLLISION_TRIANGLE:
+        *cx = (double)(shape->x + shape->x2 + shape->x3) / 3.0;
+        *cy = (double)(shape->y + shape->y2 + shape->y3) / 3.0;
+        break;
+    default:
+        *cx = (double)shape->x +
+              (shape->rot_min_x + shape->rot_max_x) / 2.0;
+        *cy = (double)shape->y +
+              (shape->rot_min_y + shape->rot_max_y) / 2.0;
+        break;
+    }
+}
+
+static int collision_angle_from_vector(double dx, double dy, int *angle)
+{
+    double deg;
+
+    if (!isfinite(dx) || !isfinite(dy) || dx * dx + dy * dy < 1e-18)
+        return 0;
+    deg = atan2(dy, dx) * 57.295779513082320876798154814105;
+    if (deg < 0.0)
+        deg += 360.0;
+    if (deg >= 360.0)
+        deg -= 360.0;
+    *angle = (int)collision_round_ll(deg) % 360;
+    return 1;
+}
+
+static int collision_triangle_normal(const CollisionShape *shape,
+                                     double cx, double cy,
+                                     double bx, double by, int *angle)
+{
+    double px[3], py[3];
+    double gx, gy;
+    double best = 0.0;
+    double nx = 0.0, ny = 0.0;
+    int found = 0;
+    int i;
+
+    px[0] = (double)shape->x;
+    py[0] = (double)shape->y;
+    px[1] = (double)shape->x2;
+    py[1] = (double)shape->y2;
+    px[2] = (double)shape->x3;
+    py[2] = (double)shape->y3;
+    gx = (px[0] + px[1] + px[2]) / 3.0;
+    gy = (py[0] + py[1] + py[2]) / 3.0;
+
+    for (i = 0; i < 3; ++i) {
+        int j = (i + 1) % 3;
+        int k = (i + 2) % 3;
+        double ex = px[j] - px[i];
+        double ey = py[j] - py[i];
+        double len2 = ex * ex + ey * ey;
+        double t = 0.0;
+        double qx, qy, d2, mx, my;
+
+        if (len2 <= 0.0)
+            continue;
+        t = ((cx - px[i]) * ex + (cy - py[i]) * ey) / len2;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+        qx = px[i] + ex * t;
+        qy = py[i] + ey * t;
+        d2 = (cx - qx) * (cx - qx) + (cy - qy) * (cy - qy);
+        if (!found || d2 < best) {
+            best = d2;
+            mx = ey;
+            my = -ex;
+            if (mx * (cx - px[k]) + my * (cy - py[k]) > 0.0) {
+                nx = mx;
+                ny = my;
+            } else {
+                nx = -mx;
+                ny = -my;
+            }
+            if (fabs(nx * (cx - gx) + ny * (cy - gy)) < 1e-12) {
+                mx = bx - gx;
+                my = by - gy;
+                if (nx * mx + ny * my < 0.0) {
+                    nx = -nx;
+                    ny = -ny;
+                }
+            }
+            found = 1;
+        }
+    }
+    return found ? collision_angle_from_vector(nx, ny, angle) : 0;
+}
+
+static int collision_surface_angle(const CollisionShape *a,
+                                   double cx, double cy,
+                                   double bx, double by, int *angle)
+{
+    double ax, ay, dx, dy;
+
+    switch (a->kind) {
+    case COLLISION_POINT:
+        return collision_angle_from_vector(bx - a->x, by - a->y, angle);
+    case COLLISION_CIRCLE:
+        dx = cx - (double)a->x;
+        dy = cy - (double)a->y;
+        if (dx * dx + dy * dy < 1e-12) {
+            dx = bx - (double)a->x;
+            dy = by - (double)a->y;
+        }
+        return collision_angle_from_vector(dx, dy, angle);
+    case COLLISION_SQUARE: {
+        double center_x = (double)a->x + (double)a->width / 2.0;
+        double center_y = (double)a->y + (double)a->height / 2.0;
+        double hw = (double)a->width / 2.0;
+        double hh = (double)a->height / 2.0;
+        double lx, ly, dl, dr, dt, db, nlx, nly, nx, ny;
+
+        if (hw <= 0.0 || hh <= 0.0)
+            return collision_angle_from_vector(cx - center_x, cy - center_y,
+                                               angle);
+        lx = (cx - center_x) * a->c + (cy - center_y) * a->s;
+        ly = -(cx - center_x) * a->s + (cy - center_y) * a->c;
+        dl = hw + lx;
+        dr = hw - lx;
+        dt = hh + ly;
+        db = hh - ly;
+        if (dl <= dr && dl <= dt && dl <= db) {
+            nlx = -1.0;
+            nly = 0.0;
+        } else if (dr <= dl && dr <= dt && dr <= db) {
+            nlx = 1.0;
+            nly = 0.0;
+        } else if (dt <= dl && dt <= dr && dt <= db) {
+            nlx = 0.0;
+            nly = -1.0;
+        } else {
+            nlx = 0.0;
+            nly = 1.0;
+        }
+        nx = nlx * a->c - nly * a->s;
+        ny = nlx * a->s + nly * a->c;
+        return collision_angle_from_vector(nx, ny, angle);
+    }
+    case COLLISION_TRIANGLE:
+        return collision_triangle_normal(a, cx, cy, bx, by, angle);
+    default:
+        collision_shape_center(a, &ax, &ay);
+        dx = cx - ax;
+        dy = cy - ay;
+        if (dx * dx + dy * dy < 1e-12) {
+            dx = bx - ax;
+            dy = by - ay;
+        }
+        return collision_angle_from_vector(dx, dy, angle);
+    }
+}
+
+static int l_contactangle(lua_State *L)
+{
+    enum { CONTACT_SAMPLES = 16, CONTACT_STEPS = 16 };
+    CollisionShape a, b, old_b, current;
+    PointBuf buf;
+    double cx, cy, bx, by;
+    double lo = 0.0, hi = 1.0, t = 0.0;
+    int angle;
+    int rc;
+    int found = 0;
+    int i;
+
+    if (collision_parse_shape(L, 1, &a) != 0)
+        return 0;
+    if (collision_parse_shape(L, 2, &b) != 0)
+        return 0;
+    if (collision_parse_shape(L, 3, &old_b) != 0)
+        return 0;
+    if (!collision_same_kind(&b, &old_b))
+        return luaL_error(L,
+            "draw.contactangle: b and old_b must describe the same shape");
+
+    if (!collision_overlap_at(L, &a, &old_b)) {
+        for (i = 0; i <= CONTACT_SAMPLES; ++i) {
+            double sample = (double)i / (double)CONTACT_SAMPLES;
+
+            collision_interpolate(&old_b, &b, sample, &current);
+            if (!collision_overlap_at(L, &a, &current))
+                continue;
+            lo = i > 0 ? (double)(i - 1) / (double)CONTACT_SAMPLES : 0.0;
+            hi = sample;
+            found = 1;
+            break;
+        }
+        if (!found) {
+            lua_pushnil(L);
+            return 1;
+        }
+        for (i = 0; i < CONTACT_STEPS; ++i) {
+            double mid = (lo + hi) / 2.0;
+
+            collision_interpolate(&old_b, &b, mid, &current);
+            if (collision_overlap_at(L, &a, &current))
+                hi = mid;
+            else
+                lo = mid;
+        }
+        t = hi;
+    }
+
+    collision_interpolate(&old_b, &b, t, &current);
+    rc = collision_common_points(L, &a, &current, &buf);
+    if (rc == -3) {
+        lua_pushnil(L);
+        return 1;
+    }
+    if (rc != 0) {
+        collision_buf_free(&buf);
+        return collision_raster_error(L, rc);
+    }
+    if (buf.count == 0) {
+        collision_buf_free(&buf);
+        lua_pushnil(L);
+        return 1;
+    }
+
+    collision_centroid(&buf, &cx, &cy);
+    collision_buf_free(&buf);
+    collision_shape_center(&current, &bx, &by);
+    if (!collision_surface_angle(&a, cx, cy, bx, by, &angle)) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_pushinteger(L, angle);
+    lua_pushinteger(L, collision_round_ll(cx));
+    lua_pushinteger(L, collision_round_ll(cy));
+    return 3;
+}
+
+static int l_collision(lua_State *L)
+{
+    CollisionShape a;
+    CollisionShape b;
+
+    if (collision_parse_shape(L, 1, &a) != 0)
+        return 0;
+    if (collision_parse_shape(L, 2, &b) != 0)
+        return 0;
+
+    if (a.kind == COLLISION_SPRITE && b.kind == COLLISION_SPRITE) {
+        PointBuf ba;
+        PointBuf bb;
+        size_t i;
+        int rc;
+        int result = 0;
+
+        rc = collision_prepare_sprite_points(L, &a, &b, &ba);
+        if (rc == -3) {
+            lua_pushboolean(L, 0);
+            return 1;
+        }
+        if (rc != 0)
+            return collision_raster_error(L, rc);
+        rc = collision_prepare_sprite_points(L, &b, &a, &bb);
+        if (rc == -3) {
+            free(ba.data);
+            lua_pushboolean(L, 0);
+            return 1;
+        }
+        if (rc != 0) {
+            free(ba.data);
+            return collision_raster_error(L, rc);
+        }
+
+        qsort(bb.data, bb.count, sizeof(CollisionPoint), collision_point_qcmp);
+        for (i = 0; i < ba.count; ++i) {
+            if (collision_point_lookup(&bb, collision_key_x(ba.data[i]),
+                                       collision_key_y(ba.data[i]))) {
+                result = 1;
+                break;
+            }
+        }
+        free(ba.data);
+        free(bb.data);
+        lua_pushboolean(L, result);
+        return 1;
+    }
+
+    if (a.kind == COLLISION_SPRITE || b.kind == COLLISION_SPRITE) {
+        const CollisionShape *sprite = a.kind == COLLISION_SPRITE ? &a : &b;
+        const CollisionShape *shape = a.kind == COLLISION_SPRITE ? &b : &a;
+        PointBuf buf;
+        size_t i;
+        int rc;
+        int result = 0;
+
+        rc = collision_prepare_sprite_points(L, sprite, shape, &buf);
+        if (rc == -3) {
+            lua_pushboolean(L, 0);
+            return 1;
+        }
+        if (rc != 0)
+            return collision_raster_error(L, rc);
+        for (i = 0; i < buf.count; ++i) {
+            if (collision_shape_contains(shape, collision_key_x(buf.data[i]),
+                                         collision_key_y(buf.data[i]))) {
+                result = 1;
+                break;
+            }
+        }
+        free(buf.data);
+        lua_pushboolean(L, result);
+        return 1;
+    }
+
+    lua_pushboolean(L, collision_shapes_overlap(L, &a, &b));
+    return 1;
+}
+
 typedef struct {
     const char *name;
     const char *usage;
@@ -5106,12 +7017,24 @@ static const HelpEntry g_help_entries[] = {
      "Проверяет одноразовое нажатие кнопки мыши."},
     {"wheel", "draw.wheel() -> dx, dy",
      "Возвращает прокрутку колеса за кадр."},
+    {"gamepadcount", "draw.gamepadcount() -> number",
+     "Возвращает число подключённых геймпадов."},
+    {"gamepadname", "draw.gamepadname([index]) -> string | nil",
+     "Возвращает имя геймпада; index по умолчанию 1."},
+    {"gamepadbutton", "draw.gamepadbutton(name, [index]) -> boolean",
+     "Проверяет, удерживается ли кнопка геймпада."},
+    {"gamepadpress", "draw.gamepadpress(name, [index]) -> boolean",
+     "Одноразовое нажатие кнопки геймпада."},
+    {"gamepadstick", "draw.gamepadstick(name, [index]) -> number",
+     "Возвращает ось геймпада: -1..1 или 0..1 для триггеров."},
+    {"gamepadrumble", "draw.gamepadrumble(left, right, [ms], [index]) -> boolean",
+     "Вибрация геймпада; сила 0..1, ms по умолчанию 200."},
     {"line", "draw.line(x1, y1, x2, y2, color, [width])",
      "Рисует линию; цвет — имя палитры или {r, g, b, [a]}."},
     {"circle", "draw.circle(x, y, radius, color, [fill])",
      "Рисует окружность; цвет — имя палитры или {r, g, b, [a]}."},
-    {"square", "draw.square(x, y, w, h, color, [fill])",
-     "Рисует прямоугольник; цвет — имя палитры или {r, g, b, [a]}."},
+    {"square", "draw.square(x, y, w, h, color, [fill], [angle])",
+     "Рисует прямоугольник с поворотом вокруг центра; углы в градусах."},
     {"triangle", "draw.triangle(x1, y1, x2, y2, x3, y3, color, [fill])",
      "Рисует треугольник; цвет — имя палитры или {r, g, b, [a]}."},
     {"text", "draw.text(x, y, text, [font], [color])",
@@ -5128,6 +7051,10 @@ static const HelpEntry g_help_entries[] = {
      "Создаёт анимацию из кадров."},
     {"draw", "draw.draw(x, y, name, [scale], [angle], [flip], [tint], [pivot])",
      "Рисует спрайт; flip={flipx,flipy}, pivot={pivotx,pivoty}, nil допустим."},
+    {"collision", "draw.collision(a, b) -> boolean",
+     "Проверяет пересечение спрайтов и фигур попиксельно."},
+    {"contactangle", "draw.contactangle(a, b, old_b) -> angle, x, y | nil",
+     "Угол первого касания: куда оттолкнуть b; 0° вправо, 90° вниз."},
     {"melody", "draw.melody(name, notes) -> index",
      "Регистрирует мелодию из частот."},
     {"midi", "draw.midi(name, path, [track]) -> index, speed",
@@ -5207,6 +7134,12 @@ static const luaL_Reg draw_lib[] = {
     {"keypress", l_keypress},
     {"mousepress", l_mousepress},
     {"wheel",   l_wheel},
+    {"gamepadcount", l_gamepadcount},
+    {"gamepadname", l_gamepadname},
+    {"gamepadbutton", l_gamepadbutton},
+    {"gamepadpress", l_gamepadpress},
+    {"gamepadstick", l_gamepadstick},
+    {"gamepadrumble", l_gamepadrumble},
     {"line",    l_line},
     {"circle",  l_circle},
     {"square",  l_square},
@@ -5218,6 +7151,8 @@ static const luaL_Reg draw_lib[] = {
     {"font",    l_font},
     {"animation", l_animation},
     {"draw",    l_draw_sprite},
+    {"collision", l_collision},
+    {"contactangle", l_contactangle},
     {"melody",  l_melody},
     {"midi",    l_midi},
     {"sound",   l_sound},
