@@ -25,6 +25,7 @@ target_link_libraries(draw PRIVATE ${LUA_LIBRARIES} SDL2::SDL2
 
 if(UNIX)
     target_link_libraries(draw PRIVATE m)
+    target_link_options(draw PRIVATE "-Wl,-rpath,$ORIGIN")
 endif()
 
 set_target_properties(draw PROPERTIES

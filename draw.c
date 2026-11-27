@@ -59,14 +59,6 @@
 #define ANIM_FRAME_MAX 1024
 #define TRIANGLE_COORD_LIMIT 500000000LL
 
-static const double k_diag = 0.70710678118654752440;
-static const double k_cos[8] = {
-    1.0, k_diag, 0.0, -k_diag, -1.0, -k_diag, 0.0, k_diag
-};
-static const double k_sin[8] = {
-    0.0, k_diag, 1.0, k_diag, 0.0, -k_diag, -1.0, -k_diag
-};
-
 typedef struct {
     int used;
     char name[PALETTE_NAME_MAX];
@@ -390,6 +382,26 @@ static int clamp_color(lua_Integer v)
     return (int)v;
 }
 
+static int clamp_color_number(lua_Number v)
+{
+    if (!isfinite(v) || v <= 0.0)
+        return 0;
+    if (v >= 255.0)
+        return 255;
+    return (int)(v + 0.5);
+}
+
+static int clamp_alpha_number(lua_Number v)
+{
+    if (!isfinite(v) || v <= 0.0)
+        return 0;
+    if (v <= 1.0)
+        return (int)(v * 255.0 + 0.5);
+    if (v >= 255.0)
+        return 255;
+    return (int)(v + 0.5);
+}
+
 static size_t palette_hash(const char *name)
 {
     size_t h = 2166136261u;
@@ -684,24 +696,42 @@ static void free_palette(void)
 
 static int read_color(lua_State *L, int first, int *r, int *g, int *b, int *a)
 {
-    int top = lua_gettop(L);
+    int i;
+    int values[4];
 
+    *r = 255;
+    *g = 255;
+    *b = 255;
     *a = 255;
-    if (top < first)
+    if (lua_gettop(L) < first)
         return -1;
 
-    if (top >= first + 2) {
-        *r = clamp_color(luaL_checkinteger(L, first));
-        *g = clamp_color(luaL_checkinteger(L, first + 1));
-        *b = clamp_color(luaL_checkinteger(L, first + 2));
+    if (lua_type(L, first) == LUA_TTABLE) {
+        for (i = 0; i < 3; ++i) {
+            lua_pushinteger(L, i + 1);
+            lua_rawget(L, first);
+            if (!lua_isnumber(L, -1))
+                return luaL_error(L,
+                    "color must be a palette name or {r, g, b, [a]}");
+            values[i] = clamp_color_number(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+        }
+        lua_pushinteger(L, 4);
+        lua_rawget(L, first);
+        if (lua_isnil(L, -1))
+            values[3] = 255;
+        else if (lua_isnumber(L, -1))
+            values[3] = clamp_alpha_number(lua_tonumber(L, -1));
+        else
+            return luaL_error(L,
+                "color must be a palette name or {r, g, b, [a]}");
+        lua_pop(L, 1);
+        *r = values[0];
+        *g = values[1];
+        *b = values[2];
+        *a = values[3];
         return 0;
     }
-
-    if (top == first + 1 &&
-        lua_type(L, first) != LUA_TSTRING &&
-        lua_type(L, first) != LUA_TNUMBER)
-        return luaL_error(L,
-            "color must be r, g, b or a palette name/index");
 
     if (lua_type(L, first) == LUA_TSTRING) {
         const char *name = lua_tostring(L, first);
@@ -717,41 +747,18 @@ static int read_color(lua_State *L, int first, int *r, int *g, int *b, int *a)
         return 0;
     }
 
-    if (lua_type(L, first) == LUA_TNUMBER) {
-        lua_Integer raw = luaL_checkinteger(L, first);
-        int index;
-
-        if (raw < 0 || raw > PALETTE_INDEX_MAX)
-            return luaL_error(L, "palette index is out of range");
-
-        index = (int)raw;
-        if (index >= g_palette_count || !g_palette[index].used)
-            return luaL_error(L, "palette index %d is not defined", index);
-
-        *r = g_palette[index].r;
-        *g = g_palette[index].g;
-        *b = g_palette[index].b;
-        *a = g_palette[index].a;
-        return 0;
-    }
-
-    return luaL_error(L, "invalid color argument");
+    return luaL_error(L,
+        "color must be a palette name or {r, g, b, [a]}");
 }
 
 static int read_fill(lua_State *L, int color_first, const char *name)
 {
-    int top = lua_gettop(L);
-    int index;
     lua_Integer value;
 
-    if (top >= color_first + 3)
-        index = color_first + 3;
-    else if (top == color_first + 1)
-        index = color_first + 1;
-    else
+    if (lua_gettop(L) < color_first + 1)
         return 0;
 
-    value = luaL_optinteger(L, index, 0);
+    value = luaL_optinteger(L, color_first + 1, 0);
     if (value < -1)
         return luaL_error(L, "%s: fill must be -1, 0, or positive", name);
     if (value > INT_MAX)
@@ -1135,9 +1142,6 @@ static int parse_angle(lua_State *L, int index)
     angle = (lua_Integer)n;
     if ((lua_Number)angle != n)
         return luaL_error(L, "draw.draw: angle must be an integer");
-    if (angle % 45 != 0)
-        return luaL_error(L,
-            "draw.draw: angle must be a multiple of 45");
 
     angle %= 360;
     if (angle < 0)
@@ -1155,9 +1159,37 @@ static int parse_flip(lua_State *L, int index, const char *option)
     return lua_toboolean(L, index);
 }
 
+static int read_flip_field(lua_State *L, int index, int field,
+                           const char *option)
+{
+    int value;
+
+    if (lua_isnoneornil(L, index))
+        return 0;
+    if (lua_type(L, index) != LUA_TTABLE)
+        return luaL_error(L, "draw.draw: %s must be a table", option);
+
+    lua_pushinteger(L, field);
+    lua_rawget(L, index);
+    value = parse_flip(L, lua_gettop(L), option);
+    lua_pop(L, 1);
+    return value;
+}
+
+static double read_pivot_field(lua_State *L, int index, int field,
+                               double default_value)
+{
+    double value;
+
+    lua_pushinteger(L, field);
+    lua_rawget(L, index);
+    value = luaL_optnumber(L, lua_gettop(L), (lua_Number)default_value);
+    lua_pop(L, 1);
+    return value;
+}
+
 static int parse_tint(lua_State *L, int index, int *r, int *g, int *b, int *a)
 {
-    lua_Integer raw;
     int i;
     int values[4];
     const char *name;
@@ -1176,7 +1208,7 @@ static int parse_tint(lua_State *L, int index, int *r, int *g, int *b, int *a)
             lua_rawget(L, index);
             if (!lua_isnumber(L, -1))
                 return luaL_error(L, "draw.draw: tint must be {r, g, b, [a]}");
-            values[i] = clamp_color((int)luaL_checkinteger(L, -1));
+            values[i] = clamp_color_number(lua_tonumber(L, -1));
             lua_pop(L, 1);
         }
         lua_pushinteger(L, 4);
@@ -1184,7 +1216,7 @@ static int parse_tint(lua_State *L, int index, int *r, int *g, int *b, int *a)
         if (lua_isnil(L, -1))
             values[3] = 255;
         else if (lua_isnumber(L, -1))
-            values[3] = clamp_color((int)luaL_checkinteger(L, -1));
+            values[3] = clamp_alpha_number(lua_tonumber(L, -1));
         else
             return luaL_error(L, "draw.draw: tint must be {r, g, b, [a]}");
         lua_pop(L, 1);
@@ -1208,23 +1240,8 @@ static int parse_tint(lua_State *L, int index, int *r, int *g, int *b, int *a)
         return 0;
     }
 
-    if (lua_type(L, index) == LUA_TNUMBER) {
-        raw = luaL_checkinteger(L, index);
-        if (raw < 0 || raw > PALETTE_INDEX_MAX)
-            return luaL_error(L, "draw.draw: tint palette index is out of range");
-        i = (int)raw;
-        if (i >= g_palette_count || !g_palette[i].used)
-            return luaL_error(L,
-                "draw.draw: tint palette index %d is not defined", i);
-        *r = g_palette[i].r;
-        *g = g_palette[i].g;
-        *b = g_palette[i].b;
-        *a = g_palette[i].a;
-        return 0;
-    }
-
     return luaL_error(L,
-        "draw.draw: tint must be a palette name/index or {r, g, b, [a]}");
+        "draw.draw: tint must be a palette name or {r, g, b, [a]}");
 }
 
 static int visible_range(double start, double size, int screen_size,
@@ -1979,7 +1996,7 @@ static int ensure_open(lua_State *L, const char *name)
     return g_draw.open;
 }
 
-static int l_pres(lua_State *L)
+static int l_present(lua_State *L)
 {
     if (!g_draw.initialized || !g_draw.open) {
         lua_pushboolean(L, 0);
@@ -3043,6 +3060,41 @@ static int l_palette(lua_State *L)
     return 1;
 }
 
+static int sprite_palette_index(lua_State *L, int index)
+{
+    const char *name;
+    int slot;
+    int r, g, b, a;
+
+    if (lua_type(L, index) == LUA_TSTRING) {
+        name = lua_tostring(L, index);
+        slot = find_palette_name(name);
+        if (slot < 0)
+            return luaL_error(L,
+                "draw.sprite: palette color '%s' is not defined", name);
+        return slot;
+    }
+
+    if (lua_type(L, index) == LUA_TTABLE) {
+        if (read_color(L, index, &r, &g, &b, &a) < 0)
+            return luaL_error(L,
+                "draw.sprite: palette entry must be a color name or {r, g, b, [a]}");
+        slot = find_free_palette();
+        if (slot < 0)
+            return luaL_error(L, "draw.sprite: out of memory");
+        g_palette[slot].name[0] = '\0';
+        g_palette[slot].used = 1;
+        g_palette[slot].r = r;
+        g_palette[slot].g = g;
+        g_palette[slot].b = b;
+        g_palette[slot].a = a;
+        return slot;
+    }
+
+    return luaL_error(L,
+        "draw.sprite: palette entry must be a color name or {r, g, b, [a]}");
+}
+
 static int l_sprite(lua_State *L)
 {
     const char *name;
@@ -3052,6 +3104,8 @@ static int l_sprite(lua_State *L)
     int row;
     int col;
     int *pixels;
+    int *palette_map = NULL;
+    int palette_count = 0;
     int index;
     size_t i;
 
@@ -3107,9 +3161,26 @@ static int l_sprite(lua_State *L)
     if (width <= 0)
         return luaL_error(L, "draw.sprite: sprite is empty");
 
+    if (!lua_isnoneornil(L, 3)) {
+        luaL_checktype(L, 3, LUA_TTABLE);
+        palette_count = (int)lua_rawlen(L, 3);
+        if (palette_count <= 0)
+            return luaL_error(L, "draw.sprite: palette is empty");
+        palette_map = (int *)malloc((size_t)palette_count * sizeof(int));
+        if (!palette_map)
+            return luaL_error(L, "draw.sprite: out of memory");
+        for (i = 0; i < (size_t)palette_count; ++i) {
+            lua_rawgeti(L, 3, (int)i + 1);
+            palette_map[i] = sprite_palette_index(L, lua_gettop(L));
+            lua_pop(L, 1);
+        }
+    }
+
     pixels = (int *)malloc((size_t)width * (size_t)height * sizeof(int));
-    if (!pixels)
+    if (!pixels) {
+        free(palette_map);
         return luaL_error(L, "draw.sprite: out of memory");
+    }
 
     for (i = 0; i < (size_t)width * (size_t)height; ++i)
         pixels[i] = -1;
@@ -3130,17 +3201,24 @@ static int l_sprite(lua_State *L)
                 } else if (lua_type(L, -1) == LUA_TNUMBER) {
                     lua_Integer raw = luaL_checkinteger(L, -1);
 
-                    if (raw < -1 || raw > PALETTE_INDEX_MAX) {
+                    int limit = palette_map ? palette_count - 1
+                                            : PALETTE_INDEX_MAX;
+
+                    if (raw < -1 || raw > limit) {
                         lua_pop(L, 2);
                         free(pixels);
+                        free(palette_map);
                         return luaL_error(L,
                             "draw.sprite: palette index is out of range in row %d",
                             row + 1);
                     }
-                    value = (int)raw;
+                    value = raw < 0 ? -1
+                                    : (palette_map ? palette_map[(int)raw]
+                                                   : (int)raw);
                 } else {
                     lua_pop(L, 2);
                     free(pixels);
+                    free(palette_map);
                     return luaL_error(L,
                         "draw.sprite: pixel in row %d must be a number",
                         row + 1);
@@ -3158,6 +3236,7 @@ static int l_sprite(lua_State *L)
             if (rc != 0) {
                 lua_pop(L, 1);
                 free(pixels);
+                free(palette_map);
                 if (rc == -2)
                     return luaL_error(L, "draw.sprite: out of memory");
                 return luaL_error(L,
@@ -3166,17 +3245,21 @@ static int l_sprite(lua_State *L)
 
             for (col = 0; col < tmp_len; ++col) {
                 int value = tmp[col];
+                int limit = palette_map ? palette_count - 1
+                                        : PALETTE_INDEX_MAX;
 
-                if (value < -1 || value > PALETTE_INDEX_MAX) {
+                if (value < -1 || value > limit) {
                     free(tmp);
                     lua_pop(L, 1);
                     free(pixels);
+                    free(palette_map);
                     return luaL_error(L,
                         "draw.sprite: palette index %d in row %d is out of range",
                         value, row + 1);
                 }
 
-                pixels[(size_t)row * width + col] = value;
+                pixels[(size_t)row * width + col] =
+                    value < 0 ? -1 : (palette_map ? palette_map[value] : value);
             }
 
             free(tmp);
@@ -3190,6 +3273,7 @@ static int l_sprite(lua_State *L)
         index = first_free_sprite();
         if (index < 0) {
             free(pixels);
+            free(palette_map);
             return luaL_error(L,
                 "draw.sprite: sprite storage is full (max %d)",
                 SPRITE_MAX);
@@ -3203,12 +3287,13 @@ static int l_sprite(lua_State *L)
     g_sprites[index].pixels = pixels;
     g_sprites[index].width = width;
     g_sprites[index].height = height;
+    free(palette_map);
 
     lua_pushinteger(L, index);
     return 1;
 }
 
-static int l_anim(lua_State *L)
+static int l_animation(lua_State *L)
 {
     const char *name;
     size_t name_len;
@@ -3221,25 +3306,25 @@ static int l_anim(lua_State *L)
     name = luaL_checkstring(L, 1);
     name_len = strlen(name);
     if (name_len == 0)
-        return luaL_error(L, "draw.anim: name must not be empty");
+        return luaL_error(L, "draw.animation: name must not be empty");
     if (name_len >= ANIM_NAME_MAX)
-        return luaL_error(L, "draw.anim: name is too long");
+        return luaL_error(L, "draw.animation: name is too long");
 
     luaL_checktype(L, 2, LUA_TTABLE);
     count = (size_t)lua_rawlen(L, 2);
     if (count == 0)
-        return luaL_error(L, "draw.anim: animation is empty");
+        return luaL_error(L, "draw.animation: animation is empty");
     if (count > ANIM_FRAME_MAX)
-        return luaL_error(L, "draw.anim: too many frames (max %d)",
+        return luaL_error(L, "draw.animation: too many frames (max %d)",
                           ANIM_FRAME_MAX);
 
     fps = luaL_optnumber(L, 3, 8.0);
     if (fps < 0.1 || fps > 1000.0)
-        return luaL_error(L, "draw.anim: fps must be 0.1..1000");
+        return luaL_error(L, "draw.animation: fps must be 0.1..1000");
 
     frames = (char **)calloc(count, sizeof(char *));
     if (!frames)
-        return luaL_error(L, "draw.anim: out of memory");
+        return luaL_error(L, "draw.animation: out of memory");
 
     for (i = 0; i < count; ++i) {
         const char *frame;
@@ -3251,7 +3336,7 @@ static int l_anim(lua_State *L)
             for (i = 0; i < count; ++i)
                 free(frames[i]);
             free(frames);
-            return luaL_error(L, "draw.anim: frame %d must be a string",
+            return luaL_error(L, "draw.animation: frame %d must be a string",
                               (int)i + 1);
         }
         frame = lua_tostring(L, -1);
@@ -3261,7 +3346,7 @@ static int l_anim(lua_State *L)
             for (i = 0; i < count; ++i)
                 free(frames[i]);
             free(frames);
-            return luaL_error(L, "draw.anim: invalid sprite name in frame %d",
+            return luaL_error(L, "draw.animation: invalid sprite name in frame %d",
                               (int)i + 1);
         }
         frames[i] = (char *)malloc(len + 1);
@@ -3270,7 +3355,7 @@ static int l_anim(lua_State *L)
             for (i = 0; i < count; ++i)
                 free(frames[i]);
             free(frames);
-            return luaL_error(L, "draw.anim: out of memory");
+            return luaL_error(L, "draw.animation: out of memory");
         }
         memcpy(frames[i], frame, len + 1);
         lua_pop(L, 1);
@@ -3283,7 +3368,7 @@ static int l_anim(lua_State *L)
             for (i = 0; i < count; ++i)
                 free(frames[i]);
             free(frames);
-            return luaL_error(L, "draw.anim: too many animations (max %d)",
+            return luaL_error(L, "draw.animation: too many animations (max %d)",
                               ANIM_MAX);
         }
         memcpy(g_anims[index].name, name, name_len + 1);
@@ -3917,7 +4002,6 @@ static int l_draw_sprite(lua_State *L)
     int flipx;
     int flipy;
     int tr, tg, tb, ta;
-    int step;
     int index;
     int sx, sy;
     int sx0, sx1, sy0, sy1;
@@ -3933,7 +4017,7 @@ static int l_draw_sprite(lua_State *L)
     double pivot_x, pivot_y;
     double px, py;
     double min_x = 0.0, max_x = 0.0, min_y = 0.0, max_y = 0.0;
-    double c, s;
+    double c, s, rad;
     double dx, dy, rot_x, rot_y, src_cx, src_cy, p, q;
     int k;
     int pivot_given;
@@ -3946,9 +4030,9 @@ static int l_draw_sprite(lua_State *L)
     name = luaL_checkstring(L, 3);
     scale = parse_scale(L, 4);
     angle = parse_angle(L, 5);
-    flipx = parse_flip(L, 6, "flipx");
-    flipy = parse_flip(L, 7, "flipy");
-    if (parse_tint(L, 8, &tr, &tg, &tb, &ta) != 0)
+    flipx = read_flip_field(L, 6, 1, "flip");
+    flipy = read_flip_field(L, 6, 2, "flip");
+    if (parse_tint(L, 7, &tr, &tg, &tb, &ta) != 0)
         return 0;
 
     index = find_sprite_name(name);
@@ -3984,15 +4068,28 @@ static int l_draw_sprite(lua_State *L)
                 "draw.draw: palette index %d is not defined", value);
     }
 
-    step = angle / 45;
     W = (double)sprite->width * (double)scale;
     H = (double)sprite->height * (double)scale;
-    c = k_cos[step];
-    s = k_sin[step];
+    rad = (double)angle * 0.017453292519943295769236907684886;
+    c = cos(rad);
+    s = sin(rad);
+    if (fabs(c) < 1e-12)
+        c = 0.0;
+    if (fabs(s) < 1e-12)
+        s = 0.0;
 
-    pivot_given = !lua_isnoneornil(L, 9) || !lua_isnoneornil(L, 10);
-    pivot_x = luaL_optnumber(L, 9, (lua_Number)sprite->width / 2.0);
-    pivot_y = luaL_optnumber(L, 10, (lua_Number)sprite->height / 2.0);
+    pivot_given = !lua_isnoneornil(L, 8);
+    if (pivot_given) {
+        if (lua_type(L, 8) != LUA_TTABLE)
+            return luaL_error(L, "draw.draw: pivot must be a table");
+        pivot_x = read_pivot_field(L, 8, 1,
+                                   (double)sprite->width / 2.0);
+        pivot_y = read_pivot_field(L, 8, 2,
+                                   (double)sprite->height / 2.0);
+    } else {
+        pivot_x = (double)sprite->width / 2.0;
+        pivot_y = (double)sprite->height / 2.0;
+    }
     if (!isfinite(pivot_x) || !isfinite(pivot_y) || pivot_x < -1000000.0 ||
         pivot_x > 1000000.0 || pivot_y < -1000000.0 ||
         pivot_y > 1000000.0)
@@ -4206,7 +4303,7 @@ static int l_mouse(lua_State *L)
     return 2;
 }
 
-static int l_xymouse(lua_State *L)
+static int l_mouseposition(lua_State *L)
 {
     const char *axis;
 
@@ -4226,10 +4323,10 @@ static int l_xymouse(lua_State *L)
         return 1;
     }
 
-    return luaL_error(L, "draw.xymouse: expected 'x' or 'y'");
+    return luaL_error(L, "draw.mouseposition: expected 'x' or 'y'");
 }
 
-static int l_mousekey(lua_State *L)
+static int l_mousebutton(lua_State *L)
 {
     if (g_input.mouse_button < 0) {
         lua_pushnil(L);
@@ -4240,7 +4337,7 @@ static int l_mousekey(lua_State *L)
     return 1;
 }
 
-static int l_keys(lua_State *L)
+static int l_lastkey(lua_State *L)
 {
     const char *name = key_name_for_code(g_input.last_key);
 
@@ -4262,7 +4359,7 @@ static int l_key(lua_State *L)
     return 1;
 }
 
-static int l_keypres(lua_State *L)
+static int l_keypress(lua_State *L)
 {
     SDL_Scancode code = find_key_code(L, 1);
 
@@ -4276,7 +4373,7 @@ static int l_keypres(lua_State *L)
     return 1;
 }
 
-static int l_mousepres(lua_State *L)
+static int l_mousepress(lua_State *L)
 {
     int index = find_mouse_button(L, 1);
 
@@ -4964,6 +5061,120 @@ static int l_stop(lua_State *L)
     return 0;
 }
 
+typedef struct {
+    const char *name;
+    const char *usage;
+    const char *description;
+} HelpEntry;
+
+static const HelpEntry g_help_entries[] = {
+    {"open", "draw.open(width, height, [fps])",
+     "Открывает окно; fps по умолчанию 60."},
+    {"present", "draw.present() -> boolean",
+     "Обновляет экран и события; false, если окно закрыто."},
+    {"close", "draw.close()",
+     "Закрывает окно."},
+    {"clear", "draw.clear([color])",
+     "Заливает экран цветом: имя палитры или {r, g, b, [a]}."},
+    {"pixel", "draw.pixel(x, y, color)",
+     "Рисует пиксель цветом: имя палитры или {r, g, b, [a]}."},
+    {"getpixel", "draw.getpixel(x, y) -> r, g, b, a | nil",
+     "Возвращает цвет пикселя."},
+    {"width", "draw.width() -> number",
+     "Возвращает ширину окна."},
+    {"height", "draw.height() -> number",
+     "Возвращает высоту окна."},
+    {"title", "draw.title([text]) -> string | nil",
+     "Возвращает или устанавливает заголовок окна."},
+    {"delta", "draw.delta() -> number",
+     "Возвращает время последнего кадра в секундах."},
+    {"alpha", "draw.alpha([a]) -> number | nil",
+     "Возвращает или устанавливает альфу по умолчанию."},
+    {"mouse", "draw.mouse() -> dx, dy",
+     "Возвращает движение мыши за кадр."},
+    {"mouseposition", "draw.mouseposition([axis]) -> x, y | number",
+     "Возвращает координаты курсора."},
+    {"mousebutton", "draw.mousebutton() -> string | nil",
+     "Возвращает последнюю нажатую кнопку мыши."},
+    {"lastkey", "draw.lastkey() -> string | nil",
+     "Возвращает последнюю нажатую клавишу."},
+    {"key", "draw.key(name) -> boolean",
+     "Проверяет, удерживается ли клавиша."},
+    {"keypress", "draw.keypress(name) -> boolean",
+     "Проверяет одноразовое нажатие клавиши."},
+    {"mousepress", "draw.mousepress(button) -> boolean",
+     "Проверяет одноразовое нажатие кнопки мыши."},
+    {"wheel", "draw.wheel() -> dx, dy",
+     "Возвращает прокрутку колеса за кадр."},
+    {"line", "draw.line(x1, y1, x2, y2, color, [width])",
+     "Рисует линию; цвет — имя палитры или {r, g, b, [a]}."},
+    {"circle", "draw.circle(x, y, radius, color, [fill])",
+     "Рисует окружность; цвет — имя палитры или {r, g, b, [a]}."},
+    {"square", "draw.square(x, y, w, h, color, [fill])",
+     "Рисует прямоугольник; цвет — имя палитры или {r, g, b, [a]}."},
+    {"triangle", "draw.triangle(x1, y1, x2, y2, x3, y3, color, [fill])",
+     "Рисует треугольник; цвет — имя палитры или {r, g, b, [a]}."},
+    {"text", "draw.text(x, y, text, [font], [color])",
+     "Рисует текст шрифтом по умолчанию или растровым."},
+    {"palette", "draw.palette(name_or_index, r, g, b, [a]) -> index",
+     "Создаёт или заменяет цвет палитры."},
+    {"sprite", "draw.sprite(name, rows, [palette]) -> index",
+     "Создаёт спрайт; palette — список цветов для индексов строк."},
+    {"spriteimage", "draw.spriteimage(name, path, [maxcolors], [alpha]) -> index, start, count",
+     "Загружает изображение как спрайт и палитру."},
+    {"font", "draw.font(name, path, [cellw], [cellh], [first], [scale]) -> index",
+     "Загружает растровый шрифт."},
+    {"animation", "draw.animation(name, frames, [fps]) -> index",
+     "Создаёт анимацию из кадров."},
+    {"draw", "draw.draw(x, y, name, [scale], [angle], [flip], [tint], [pivot])",
+     "Рисует спрайт; flip={flipx,flipy}, pivot={pivotx,pivoty}, nil допустим."},
+    {"melody", "draw.melody(name, notes) -> index",
+     "Регистрирует мелодию из частот."},
+    {"midi", "draw.midi(name, path, [track]) -> index, speed",
+     "Загружает MIDI как мелодию."},
+    {"sound", "draw.sound(name, path) -> index",
+     "Загружает WAV-звук."},
+    {"play", "draw.play(name, [volume], [speed], [wave]) -> boolean",
+     "Воспроизводит мелодию или звук."},
+    {"stop", "draw.stop()",
+     "Останавливает воспроизведение."},
+    {"help", "draw.help([command])",
+     "Печатает список команд или справку по команде."}
+};
+
+static const HelpEntry *find_help_entry(const char *name)
+{
+    size_t i;
+    for (i = 0; i < sizeof(g_help_entries) / sizeof(g_help_entries[0]); ++i) {
+        if (strcmp(g_help_entries[i].name, name) == 0)
+            return &g_help_entries[i];
+    }
+    return NULL;
+}
+
+static int l_help(lua_State *L)
+{
+    const HelpEntry *entry;
+    size_t i;
+
+    if (lua_isnoneornil(L, 1)) {
+        fputs("draw commands:\n", stdout);
+        for (i = 0; i < sizeof(g_help_entries) / sizeof(g_help_entries[0]); ++i) {
+            entry = &g_help_entries[i];
+            printf("  %-14s %s\n", entry->name, entry->usage);
+        }
+        fflush(stdout);
+        return 0;
+    }
+
+    entry = find_help_entry(luaL_checkstring(L, 1));
+    if (!entry)
+        return luaL_error(L, "draw.help: unknown command");
+    printf("%s\n  %s\n", entry->usage, entry->description);
+    fflush(stdout);
+    return 0;
+}
+
 static void auto_close(void)
 {
     if (g_draw.initialized)
@@ -4979,7 +5190,7 @@ static void auto_close(void)
 
 static const luaL_Reg draw_lib[] = {
     {"open",    l_open},
-    {"pres",    l_pres},
+    {"present", l_present},
     {"clear",   l_clear},
     {"pixel",   l_pixel},
     {"getpixel", l_getpixel},
@@ -4989,12 +5200,12 @@ static const luaL_Reg draw_lib[] = {
     {"delta",   l_delta},
     {"alpha",   l_alpha},
     {"mouse",   l_mouse},
-    {"xymouse", l_xymouse},
-    {"mousekey", l_mousekey},
-    {"keys",    l_keys},
+    {"mouseposition", l_mouseposition},
+    {"mousebutton", l_mousebutton},
+    {"lastkey", l_lastkey},
     {"key",     l_key},
-    {"keypres", l_keypres},
-    {"mousepres", l_mousepres},
+    {"keypress", l_keypress},
+    {"mousepress", l_mousepress},
     {"wheel",   l_wheel},
     {"line",    l_line},
     {"circle",  l_circle},
@@ -5005,13 +5216,14 @@ static const luaL_Reg draw_lib[] = {
     {"sprite",  l_sprite},
     {"spriteimage", l_spriteimage},
     {"font",    l_font},
-    {"anim",    l_anim},
+    {"animation", l_animation},
     {"draw",    l_draw_sprite},
     {"melody",  l_melody},
     {"midi",    l_midi},
     {"sound",   l_sound},
     {"play",    l_play},
     {"stop",    l_stop},
+    {"help",    l_help},
     {"close",   l_close},
     {NULL, NULL}
 };
