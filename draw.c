@@ -12,8 +12,12 @@
 
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
+#include <SDL_opengl.h>
+#include <SDL_opengl_glext.h>
 
 #include <SDL_image.h>
+#include <SDL_ttf.h>
+#include <SDL_mixer.h>
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -58,6 +62,25 @@
 #define ANIM_NAME_MAX 64
 #define ANIM_FRAME_MAX 1024
 #define TRIANGLE_COORD_LIMIT 500000000LL
+#define CANVAS_MAX 64
+#define CANVAS_DIM_MAX 4096
+#define CANVAS_AREA_MAX 4194304
+#define CANVAS_TOTAL_MAX 16777216
+#define TILEMAP_MAX 32
+#define TILEMAP_ROW_MAX 256
+#define TILEMAP_COL_MAX 256
+#define TILEMAP_TILE_MAX 64
+#define TILEMAP_BODY_MAX 512
+#define TTF_FONT_MAX 32
+#define TTF_CACHE_MAX 256
+#define MIXER_ASSET_MAX 64
+#define MIXER_CHANNEL_MAX 64
+#define SHADER_MAX 32
+#define SHADER_NAME_MAX 64
+#define SHADER_SOURCE_MAX (64 * 1024)
+#define PARTICLE_MAX 2048
+#define TWEEN_MAX 128
+#define AUX_PI 3.14159265358979323846
 
 typedef struct {
     int used;
@@ -137,6 +160,76 @@ typedef struct {
 } FontEntry;
 
 typedef struct {
+    int used;
+    int width;
+    int height;
+    uint32_t *pixels;
+} CanvasEntry;
+
+typedef struct {
+    int used;
+    char name[PALETTE_NAME_MAX];
+    int rows;
+    int cols;
+    int size;
+    char tiles[TILEMAP_TILE_MAX][SPRITE_NAME_MAX];
+    signed char cells[TILEMAP_ROW_MAX * TILEMAP_COL_MAX];
+    int body_count;
+    int body_ids[TILEMAP_BODY_MAX];
+} TilemapEntry;
+
+typedef struct {
+    int used;
+    char name[PALETTE_NAME_MAX];
+    TTF_Font *font;
+    int ptsize;
+} TtfEntry;
+
+typedef struct {
+    int used;
+    int font_id;
+    char *text;
+    SDL_Surface *surface;
+    unsigned long stamp;
+} TtfCacheEntry;
+
+typedef struct {
+    int used;
+    int kind;
+    char name[PALETTE_NAME_MAX];
+    Mix_Chunk *chunk;
+    Mix_Music *music;
+} MixerEntry;
+
+typedef struct {
+    int used;
+    char name[SHADER_NAME_MAX];
+    GLuint program;
+} ShaderEntry;
+
+typedef struct {
+    int used;
+    double x, y;
+    double vx, vy;
+    double life;
+    double max_life;
+    double gravity;
+    double drag;
+    int size;
+    int r, g, b, a;
+} ParticleEntry;
+
+typedef struct {
+    int used;
+    double from;
+    double to;
+    double delay;
+    double duration;
+    double elapsed;
+    int easing;
+} TweenEntry;
+
+typedef struct {
     int width;
     int height;
     uint32_t *pixels;        /* ARGB8888, width * height */
@@ -146,6 +239,13 @@ typedef struct {
     SDL_Window *window;
     SDL_Renderer *renderer;
     SDL_Texture *texture;
+    SDL_GLContext gl_context;
+    GLuint gl_texture;
+    GLuint gl_program;
+    GLuint gl_vbo;
+    int gl_ready;
+    int viewport_x, viewport_y, viewport_w, viewport_h;
+    Uint32 start_tick;
     SDL_Rect dirty;          /* pending region, valid when has_dirty != 0 */
     int has_dirty;
     int fps;
@@ -170,8 +270,65 @@ static AnimEntry g_anims[ANIM_MAX];
 static FontEntry g_fonts[FONT_MAX];
 static MelodyEntry g_melodies[MELODY_MAX];
 static AudioState g_audio;
+static CanvasEntry g_canvases[CANVAS_MAX];
+static TilemapEntry g_tilemaps[TILEMAP_MAX];
+static TtfEntry g_ttf_fonts[TTF_FONT_MAX];
+static TtfCacheEntry g_ttf_cache[TTF_CACHE_MAX];
+static unsigned long g_ttf_stamp;
+static MixerEntry g_mixer_assets[MIXER_ASSET_MAX];
+static int g_mixer_ready;
+static ShaderEntry g_shaders[SHADER_MAX];
+static int g_active_shader;
+static char g_shader_error[512];
+static ParticleEntry g_particles[PARTICLE_MAX];
+static TweenEntry g_tweens[TWEEN_MAX];
+
+static PFNGLCREATESHADERPROC glCreateShader = NULL;
+static PFNGLSHADERSOURCEPROC glShaderSource = NULL;
+static PFNGLCOMPILESHADERPROC glCompileShader = NULL;
+static PFNGLGETSHADERIVPROC glGetShaderiv = NULL;
+static PFNGLGETSHADERINFOLOGPROC glGetShaderInfoLog = NULL;
+static PFNGLDELETESHADERPROC glDeleteShader = NULL;
+static PFNGLCREATEPROGRAMPROC glCreateProgram = NULL;
+static PFNGLATTACHSHADERPROC glAttachShader = NULL;
+static PFNGLLINKPROGRAMPROC glLinkProgram = NULL;
+static PFNGLGETPROGRAMIVPROC glGetProgramiv = NULL;
+static PFNGLGETPROGRAMINFOLOGPROC glGetProgramInfoLog = NULL;
+static PFNGLDELETEPROGRAMPROC glDeleteProgram = NULL;
+static PFNGLGENBUFFERSPROC glGenBuffers = NULL;
+static PFNGLBINDBUFFERPROC glBindBuffer = NULL;
+static PFNGLBUFFERDATAPROC glBufferData = NULL;
+static PFNGLDELETEBUFFERSPROC glDeleteBuffers = NULL;
+static PFNGLUSEPROGRAMPROC glUseProgram = NULL;
+static PFNGLUNIFORM1IPROC glUniform1i = NULL;
+static PFNGLUNIFORM1FPROC glUniform1f = NULL;
+static PFNGLUNIFORM2FPROC glUniform2f = NULL;
+static PFNGLUNIFORM3FPROC glUniform3f = NULL;
+static PFNGLUNIFORM4FPROC glUniform4f = NULL;
+static PFNGLGETUNIFORMLOCATIONPROC glGetUniformLocation = NULL;
+static PFNGLGETATTRIBLOCATIONPROC glGetAttribLocation = NULL;
+static PFNGLENABLEVERTEXATTRIBARRAYPROC glEnableVertexAttribArray = NULL;
+static PFNGLVERTEXATTRIBPOINTERPROC glVertexAttribPointer = NULL;
+static PFNGLDISABLEVERTEXATTRIBARRAYPROC glDisableVertexAttribArray = NULL;
+static int g_channel_left[MIXER_CHANNEL_MAX];
+static int g_channel_right[MIXER_CHANNEL_MAX];
+static double g_listener_x;
+static double g_listener_y;
+static double g_listener_spread = 320.0;
+static double g_camera_x;
+static double g_camera_y;
+static uint32_t *g_main_pixels;
+static int g_main_width;
+static int g_main_height;
+static int g_canvas_target;
 
 static void audio_update_finished(void);
+static void physics_clear_state(void);
+static void canvas_restore_main(void);
+static void free_canvases(void);
+static void tilemap_clear_bodyrefs(void);
+static void free_tilemaps(void);
+static void shader_release_resources(void);
 
 typedef struct {
     int down[SDL_NUM_SCANCODES];
@@ -1347,10 +1504,48 @@ static int visible_range(double start, double size, int screen_size,
     return *out_start <= *out_end;
 }
 
+static void canvas_restore_main(void)
+{
+    if (g_canvas_target == 0)
+        return;
+    g_draw.pixels = g_main_pixels;
+    g_draw.width = g_main_width;
+    g_draw.height = g_main_height;
+    g_canvas_target = 0;
+}
+
+static void free_canvases(void)
+{
+    int i;
+
+    for (i = 0; i < CANVAS_MAX; ++i) {
+        free(g_canvases[i].pixels);
+        memset(&g_canvases[i], 0, sizeof(g_canvases[i]));
+    }
+}
+
+static void tilemap_clear_bodyrefs(void)
+{
+    int i;
+
+    for (i = 0; i < TILEMAP_MAX; ++i) {
+        g_tilemaps[i].body_count = 0;
+        memset(g_tilemaps[i].body_ids, 0, sizeof(g_tilemaps[i].body_ids));
+    }
+}
+
+static void free_tilemaps(void)
+{
+    tilemap_clear_bodyrefs();
+    memset(g_tilemaps, 0, sizeof(g_tilemaps));
+}
+
 static void mark_dirty(int x, int y)
 {
     int x1, y1;
 
+    if (g_canvas_target != 0)
+        return;
     if (x < 0 || x >= g_draw.width || y < 0 || y >= g_draw.height)
         return;
 
@@ -1384,6 +1579,8 @@ static void mark_dirty_rect(int x, int y, int w, int h)
     int x1 = x + w;
     int y1 = y + h;
 
+    if (g_canvas_target != 0)
+        return;
     if (x < 0)
         x = 0;
     if (y < 0)
@@ -1900,10 +2097,345 @@ static void draw_line(long long x1, long long y1,
     }
 }
 
+static const char *g_shader_default_vertex =
+    "attribute vec2 a_position;\n"
+    "attribute vec2 a_uv;\n"
+    "varying vec2 v_texcoord;\n"
+    "void main() {\n"
+    "    v_texcoord = a_uv;\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *g_shader_default_fragment =
+    "varying vec2 v_texcoord;\n"
+    "uniform sampler2D u_texture;\n"
+    "void main() {\n"
+    "    vec4 c = texture2D(u_texture, v_texcoord);\n"
+    "    gl_FragColor = vec4(c.rgb * c.a, 1.0);\n"
+    "}\n";
+
+static const char *g_shader_soft_fragment =
+    "varying vec2 v_texcoord;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform vec2 u_resolution;\n"
+    "uniform float u_softness;\n"
+    "void main() {\n"
+    "    vec2 px = 1.0 / max(u_resolution, vec2(1.0));\n"
+    "    vec4 c = texture2D(u_texture, v_texcoord);\n"
+    "    vec4 blur = c * 4.0;\n"
+    "    blur += texture2D(u_texture, v_texcoord + vec2(px.x, 0.0)) * 2.0;\n"
+    "    blur += texture2D(u_texture, v_texcoord - vec2(px.x, 0.0)) * 2.0;\n"
+    "    blur += texture2D(u_texture, v_texcoord + vec2(0.0, px.y)) * 2.0;\n"
+    "    blur += texture2D(u_texture, v_texcoord - vec2(0.0, px.y)) * 2.0;\n"
+    "    blur += texture2D(u_texture, v_texcoord + px);\n"
+    "    blur += texture2D(u_texture, v_texcoord - px);\n"
+    "    blur += texture2D(u_texture, v_texcoord + vec2(px.x, -px.y));\n"
+    "    blur += texture2D(u_texture, v_texcoord + vec2(-px.x, px.y));\n"
+    "    blur /= 16.0;\n"
+    "    vec3 rgb = mix(c.rgb, blur.rgb, clamp(u_softness, 0.0, 1.0));\n"
+    "    gl_FragColor = vec4(rgb * c.a, 1.0);\n"
+    "}\n";
+
+static int shader_load_functions(void)
+{
+#define LOAD_GL(name, type) do { \
+        name = (type)SDL_GL_GetProcAddress(#name); \
+        if (!name) \
+            return -1; \
+    } while (0)
+
+    LOAD_GL(glCreateShader, PFNGLCREATESHADERPROC);
+    LOAD_GL(glShaderSource, PFNGLSHADERSOURCEPROC);
+    LOAD_GL(glCompileShader, PFNGLCOMPILESHADERPROC);
+    LOAD_GL(glGetShaderiv, PFNGLGETSHADERIVPROC);
+    LOAD_GL(glGetShaderInfoLog, PFNGLGETSHADERINFOLOGPROC);
+    LOAD_GL(glDeleteShader, PFNGLDELETESHADERPROC);
+    LOAD_GL(glCreateProgram, PFNGLCREATEPROGRAMPROC);
+    LOAD_GL(glAttachShader, PFNGLATTACHSHADERPROC);
+    LOAD_GL(glLinkProgram, PFNGLLINKPROGRAMPROC);
+    LOAD_GL(glGetProgramiv, PFNGLGETPROGRAMIVPROC);
+    LOAD_GL(glGetProgramInfoLog, PFNGLGETPROGRAMINFOLOGPROC);
+    LOAD_GL(glDeleteProgram, PFNGLDELETEPROGRAMPROC);
+    LOAD_GL(glGenBuffers, PFNGLGENBUFFERSPROC);
+    LOAD_GL(glBindBuffer, PFNGLBINDBUFFERPROC);
+    LOAD_GL(glBufferData, PFNGLBUFFERDATAPROC);
+    LOAD_GL(glDeleteBuffers, PFNGLDELETEBUFFERSPROC);
+    LOAD_GL(glUseProgram, PFNGLUSEPROGRAMPROC);
+    LOAD_GL(glUniform1i, PFNGLUNIFORM1IPROC);
+    LOAD_GL(glUniform1f, PFNGLUNIFORM1FPROC);
+    LOAD_GL(glUniform2f, PFNGLUNIFORM2FPROC);
+    LOAD_GL(glUniform3f, PFNGLUNIFORM3FPROC);
+    LOAD_GL(glUniform4f, PFNGLUNIFORM4FPROC);
+    LOAD_GL(glGetUniformLocation, PFNGLGETUNIFORMLOCATIONPROC);
+    LOAD_GL(glGetAttribLocation, PFNGLGETATTRIBLOCATIONPROC);
+    LOAD_GL(glEnableVertexAttribArray, PFNGLENABLEVERTEXATTRIBARRAYPROC);
+    LOAD_GL(glVertexAttribPointer, PFNGLVERTEXATTRIBPOINTERPROC);
+    LOAD_GL(glDisableVertexAttribArray, PFNGLDISABLEVERTEXATTRIBARRAYPROC);
+#undef LOAD_GL
+    return 0;
+}
+
+static GLuint shader_compile_stage(GLenum kind, const char *source, char *log,
+                                   size_t log_size)
+{
+    GLuint shader = glCreateShader(kind);
+    GLint ok = 0;
+
+    if (!shader)
+        return 0;
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        if (log && log_size > 0) {
+            glGetShaderInfoLog(shader, (GLsizei)log_size, NULL, log);
+            log[log_size - 1] = '\0';
+        }
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static GLuint shader_link_program(const char *vertex, const char *fragment,
+                                  char *log, size_t log_size)
+{
+    GLuint vs;
+    GLuint fs;
+    GLuint program;
+    GLint ok = 0;
+
+    if (log && log_size > 0)
+        log[0] = '\0';
+    vs = shader_compile_stage(GL_VERTEX_SHADER, vertex, log, log_size);
+    if (!vs)
+        return 0;
+    fs = shader_compile_stage(GL_FRAGMENT_SHADER, fragment, log, log_size);
+    if (!fs) {
+        glDeleteShader(vs);
+        return 0;
+    }
+    program = glCreateProgram();
+    if (!program) {
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        return 0;
+    }
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok && log && log_size > 0) {
+        glGetProgramInfoLog(program, (GLsizei)log_size, NULL, log);
+        log[log_size - 1] = '\0';
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!ok) {
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
+static ShaderEntry *shader_by_id(lua_Integer id)
+{
+    if (id < 1 || id > SHADER_MAX)
+        return NULL;
+    if (!g_shaders[id - 1].used)
+        return NULL;
+    return &g_shaders[id - 1];
+}
+
+static int find_shader_name(const char *name)
+{
+    int i;
+
+    for (i = 0; i < SHADER_MAX; ++i) {
+        if (g_shaders[i].used && strcmp(g_shaders[i].name, name) == 0)
+            return i + 1;
+    }
+    return 0;
+}
+
+static GLuint shader_active_program(void)
+{
+    if (g_active_shader > 0 && g_shaders[g_active_shader - 1].used)
+        return g_shaders[g_active_shader - 1].program;
+    return g_draw.gl_program;
+}
+
+static int shader_init_default(void)
+{
+    static const float quad[] = {
+        -1.0f,  1.0f, 0.0f, 0.0f,
+         1.0f,  1.0f, 1.0f, 0.0f,
+        -1.0f, -1.0f, 0.0f, 1.0f,
+         1.0f, -1.0f, 1.0f, 1.0f
+    };
+
+    g_draw.gl_program = shader_link_program(
+        g_shader_default_vertex, g_shader_default_fragment,
+        g_shader_error, sizeof(g_shader_error));
+    if (!g_draw.gl_program)
+        return -1;
+
+    memset(&g_shaders[0], 0, sizeof(g_shaders[0]));
+    g_shaders[0].used = 1;
+    strcpy(g_shaders[0].name, "soft");
+    g_shaders[0].program = shader_link_program(
+        g_shader_default_vertex, g_shader_soft_fragment,
+        g_shader_error, sizeof(g_shader_error));
+    if (!g_shaders[0].program)
+        return -1;
+
+    glGenTextures(1, &g_draw.gl_texture);
+    glBindTexture(GL_TEXTURE_2D, g_draw.gl_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_draw.width, g_draw.height, 0,
+                 GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+
+    glGenBuffers(1, &g_draw.gl_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_draw.gl_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    return 0;
+}
+
+static void shader_release_resources(void)
+{
+    int i;
+
+    for (i = 0; i < SHADER_MAX; ++i) {
+        if (g_shaders[i].used && g_shaders[i].program) {
+            glDeleteProgram(g_shaders[i].program);
+            g_shaders[i].program = 0;
+        }
+        g_shaders[i].used = 0;
+        g_shaders[i].name[0] = '\0';
+    }
+    g_active_shader = 0;
+    if (g_draw.gl_program) {
+        glDeleteProgram(g_draw.gl_program);
+        g_draw.gl_program = 0;
+    }
+    if (g_draw.gl_texture) {
+        glDeleteTextures(1, &g_draw.gl_texture);
+        g_draw.gl_texture = 0;
+    }
+    if (g_draw.gl_vbo) {
+        glDeleteBuffers(1, &g_draw.gl_vbo);
+        g_draw.gl_vbo = 0;
+    }
+    if (g_draw.gl_context) {
+        SDL_GL_DeleteContext(g_draw.gl_context);
+        g_draw.gl_context = NULL;
+    }
+    g_draw.gl_ready = 0;
+}
+
+static void shader_compute_viewport(int *vx, int *vy, int *vw, int *vh)
+{
+    int win_w = 1;
+    int win_h = 1;
+    double scale;
+
+    SDL_GetWindowSize(g_draw.window, &win_w, &win_h);
+    if (win_w <= 0)
+        win_w = 1;
+    if (win_h <= 0)
+        win_h = 1;
+    if (g_main_width <= 0 || g_main_height <= 0) {
+        *vx = 0;
+        *vy = 0;
+        *vw = win_w;
+        *vh = win_h;
+        return;
+    }
+    scale = (double)win_w / (double)g_main_width;
+    if ((double)win_h / (double)g_main_height < scale)
+        scale = (double)win_h / (double)g_main_height;
+    if (scale <= 0.0)
+        scale = 1.0;
+    *vw = (int)(g_main_width * scale);
+    *vh = (int)(g_main_height * scale);
+    if (*vw < 1)
+        *vw = 1;
+    if (*vh < 1)
+        *vh = 1;
+    *vx = (win_w - *vw) / 2;
+    *vy = (win_h - *vh) / 2;
+    if (*vx < 0)
+        *vx = 0;
+    if (*vy < 0)
+        *vy = 0;
+}
+
+static void shader_present(void)
+{
+    GLuint program;
+    GLint pos;
+    GLint uv;
+    float elapsed;
+
+    shader_compute_viewport(&g_draw.viewport_x, &g_draw.viewport_y,
+                            &g_draw.viewport_w, &g_draw.viewport_h);
+    glViewport(g_draw.viewport_x, g_draw.viewport_y,
+               g_draw.viewport_w, g_draw.viewport_h);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_draw.gl_texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                    g_main_width, g_main_height,
+                    GL_BGRA, GL_UNSIGNED_BYTE, g_main_pixels);
+
+    program = shader_active_program();
+    glUseProgram(program);
+    glUniform1i(glGetUniformLocation(program, "u_texture"), 0);
+    glUniform2f(glGetUniformLocation(program, "u_resolution"),
+                (float)g_main_width, (float)g_main_height);
+    elapsed = (float)(SDL_GetTicks() - g_draw.start_tick) / 1000.0f;
+    glUniform1f(glGetUniformLocation(program, "u_time"), elapsed);
+    if (program == g_shaders[0].program && g_shaders[0].used)
+        glUniform1f(glGetUniformLocation(program, "u_softness"), 0.35f);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_draw.gl_vbo);
+    pos = glGetAttribLocation(program, "a_position");
+    uv = glGetAttribLocation(program, "a_uv");
+    if (pos >= 0) {
+        glEnableVertexAttribArray((GLuint)pos);
+        glVertexAttribPointer((GLuint)pos, 2, GL_FLOAT, GL_FALSE,
+                              4 * sizeof(float), (const void *)0);
+    }
+    if (uv >= 0) {
+        glEnableVertexAttribArray((GLuint)uv);
+        glVertexAttribPointer((GLuint)uv, 2, GL_FLOAT, GL_FALSE,
+                              4 * sizeof(float),
+                              (const void *)(2 * sizeof(float)));
+    }
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (pos >= 0)
+        glDisableVertexAttribArray((GLuint)pos);
+    if (uv >= 0)
+        glDisableVertexAttribArray((GLuint)uv);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    SDL_GL_SwapWindow(g_draw.window);
+}
+
 static void present(void)
 {
     if (!g_draw.initialized || !g_draw.open)
         return;
+    if (g_draw.gl_ready) {
+        shader_present();
+        g_draw.has_dirty = 0;
+        return;
+    }
 
     if (g_draw.has_dirty) {
         SDL_Rect r = g_draw.dirty;
@@ -2201,6 +2733,26 @@ static void gamepad_handle_event(const SDL_Event *e)
 static void event_position_to_logical(int win_x, int win_y,
                                       int *out_x, int *out_y)
 {
+    if (g_draw.gl_ready) {
+        int vx, vy, vw, vh;
+        double scale_x;
+        double scale_y;
+
+        shader_compute_viewport(&vx, &vy, &vw, &vh);
+        scale_x = (double)g_main_width / (double)(vw > 0 ? vw : 1);
+        scale_y = (double)g_main_height / (double)(vh > 0 ? vh : 1);
+        *out_x = (int)((win_x - vx) * scale_x);
+        *out_y = (int)((win_y - vy) * scale_y);
+        if (*out_x < 0)
+            *out_x = 0;
+        if (*out_y < 0)
+            *out_y = 0;
+        if (*out_x >= g_main_width)
+            *out_x = g_main_width - 1;
+        if (*out_y >= g_main_height)
+            *out_y = g_main_height - 1;
+        return;
+    }
 #if SDL_VERSION_ATLEAST(2, 0, 18)
     float logical_x, logical_y;
 
@@ -2223,25 +2775,40 @@ static void event_position_to_logical(int win_x, int win_y,
         if (win_h <= 0)
             win_h = 1;
 
-        *out_x = (int)((long long)win_x * g_draw.width / win_w);
-        *out_y = (int)((long long)win_y * g_draw.height / win_h);
+        *out_x = (int)((long long)win_x * g_main_width / win_w);
+        *out_y = (int)((long long)win_y * g_main_height / win_h);
     }
 }
 
 static void event_delta_to_logical(int win_dx, int win_dy,
                                    int *out_dx, int *out_dy)
 {
-    int win_w = 1;
-    int win_h = 1;
+    if (g_draw.gl_ready) {
+        int vx, vy, vw, vh;
+        double scale_x;
+        double scale_y;
 
-    SDL_GetWindowSize(g_draw.window, &win_w, &win_h);
-    if (win_w <= 0)
-        win_w = 1;
-    if (win_h <= 0)
-        win_h = 1;
+        shader_compute_viewport(&vx, &vy, &vw, &vh);
+        scale_x = (double)g_main_width / (double)(vw > 0 ? vw : 1);
+        scale_y = (double)g_main_height / (double)(vh > 0 ? vh : 1);
+        *out_dx = (int)(win_dx * scale_x);
+        *out_dy = (int)(win_dy * scale_y);
+        return;
+    }
 
-    *out_dx = (int)((long long)win_dx * g_draw.width / win_w);
-    *out_dy = (int)((long long)win_dy * g_draw.height / win_h);
+    {
+        int win_w = 1;
+        int win_h = 1;
+
+        SDL_GetWindowSize(g_draw.window, &win_w, &win_h);
+        if (win_w <= 0)
+            win_w = 1;
+        if (win_h <= 0)
+            win_h = 1;
+
+        *out_dx = (int)((long long)win_dx * g_main_width / win_w);
+        *out_dy = (int)((long long)win_dy * g_main_height / win_h);
+    }
 }
 
 static void update_frame_delta(void)
@@ -2427,6 +2994,7 @@ static int ensure_open(lua_State *L, const char *name)
 
 static int l_present(lua_State *L)
 {
+    canvas_restore_main();
     if (!g_draw.initialized || !g_draw.open) {
         lua_pushboolean(L, 0);
         return 1;
@@ -3277,8 +3845,180 @@ static void audio_update_finished(void)
         SDL_PauseAudioDevice(g_audio.device, 1);
 }
 
+enum {
+    EASE_LINEAR,
+    EASE_QUAD_IN,
+    EASE_QUAD_OUT,
+    EASE_QUAD_INOUT,
+    EASE_CUBIC_OUT,
+    EASE_SINE_INOUT,
+    EASE_BACK_OUT,
+    EASE_ELASTIC_OUT
+};
+
+static void particle_clear_state(void)
+{
+    memset(g_particles, 0, sizeof(g_particles));
+}
+
+static void tween_clear_state(void)
+{
+    memset(g_tweens, 0, sizeof(g_tweens));
+}
+
+static double aux_step(lua_State *L, int index, const char *where)
+{
+    double dt = luaL_optnumber(L, index, g_draw.frame_delta);
+
+    if (!isfinite(dt) || dt < 0.0 || dt > 1.0)
+        return luaL_error(L, "%s: dt must be finite and between 0 and 1",
+                          where);
+    return dt;
+}
+
+static void particle_update(double dt)
+{
+    int i;
+
+    for (i = 0; i < PARTICLE_MAX; ++i) {
+        ParticleEntry *p = &g_particles[i];
+        double damping;
+
+        if (!p->used)
+            continue;
+        p->vy += p->gravity * dt;
+        damping = pow(p->drag, dt);
+        p->vx *= damping;
+        p->vy *= damping;
+        p->x += p->vx * dt;
+        p->y += p->vy * dt;
+        p->life -= dt;
+        if (p->life <= 0.0)
+            memset(p, 0, sizeof(*p));
+    }
+}
+
+static void particle_draw_all(void)
+{
+    int i;
+
+    for (i = 0; i < PARTICLE_MAX; ++i) {
+        ParticleEntry *p = &g_particles[i];
+        double life = 1.0;
+        uint32_t color;
+        long long px;
+        long long py;
+
+        if (!p->used)
+            continue;
+        if (p->max_life > 0.0) {
+            life = p->life / p->max_life;
+            if (life < 0.0)
+                life = 0.0;
+            if (life > 1.0)
+                life = 1.0;
+        }
+        color = make_color(p->r, p->g, p->b, (int)(p->a * life + 0.5));
+        px = (long long)(p->x + 0.5);
+        py = (long long)(p->y + 0.5);
+        if (p->size <= 2)
+            fill_rect(px, py, 1, 1, 0, color);
+        else
+            fill_circle(px, py, p->size / 2, 0, color);
+    }
+}
+
+static int parse_easing(lua_State *L, int index, const char *where)
+{
+    const char *name = luaL_optstring(L, index, "quadout");
+
+    if (strcmp(name, "linear") == 0)
+        return EASE_LINEAR;
+    if (strcmp(name, "quadin") == 0)
+        return EASE_QUAD_IN;
+    if (strcmp(name, "quadout") == 0)
+        return EASE_QUAD_OUT;
+    if (strcmp(name, "quadinout") == 0)
+        return EASE_QUAD_INOUT;
+    if (strcmp(name, "cubicout") == 0)
+        return EASE_CUBIC_OUT;
+    if (strcmp(name, "sineinout") == 0)
+        return EASE_SINE_INOUT;
+    if (strcmp(name, "backout") == 0)
+        return EASE_BACK_OUT;
+    if (strcmp(name, "elasticout") == 0)
+        return EASE_ELASTIC_OUT;
+    return luaL_error(L, "%s: unknown easing '%s'", where, name);
+}
+
+static double easing_value(int easing, double t)
+{
+    if (t <= 0.0)
+        return 0.0;
+    if (t >= 1.0)
+        return 1.0;
+    if (easing == EASE_LINEAR)
+        return t;
+    if (easing == EASE_QUAD_IN)
+        return t * t;
+    if (easing == EASE_QUAD_OUT)
+        return 1.0 - (1.0 - t) * (1.0 - t);
+    if (easing == EASE_QUAD_INOUT)
+        return t < 0.5 ? 2.0 * t * t : 1.0 - 2.0 * (1.0 - t) * (1.0 - t);
+    if (easing == EASE_CUBIC_OUT)
+        return 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+    if (easing == EASE_SINE_INOUT)
+        return 0.5 - 0.5 * cos(AUX_PI * t);
+    if (easing == EASE_BACK_OUT) {
+        double c = 1.70158;
+        double u = t - 1.0;
+
+        return 1.0 + (c + 1.0) * u * u * u + c * u * u;
+    }
+    if (easing == EASE_ELASTIC_OUT) {
+        double u = t - 1.0;
+
+        return pow(2.0, -10.0 * t) * sin((u * 6.0 - 0.75) *
+               (2.0 * AUX_PI / 3.0)) + 1.0;
+    }
+    return t;
+}
+
+static double tween_value(const TweenEntry *tw)
+{
+    double t;
+
+    if (tw->elapsed <= tw->delay)
+        return tw->from;
+    t = (tw->elapsed - tw->delay) / tw->duration;
+    if (t < 0.0)
+        t = 0.0;
+    if (t > 1.0)
+        t = 1.0;
+    return tw->from + (tw->to - tw->from) * easing_value(tw->easing, t);
+}
+
+static int tween_finished(const TweenEntry *tw)
+{
+    return tw->elapsed >= tw->delay + tw->duration;
+}
+
+static void tween_update(double dt)
+{
+    int i;
+
+    for (i = 0; i < TWEEN_MAX; ++i) {
+        if (g_tweens[i].used)
+            g_tweens[i].elapsed += dt;
+    }
+}
+
 static void destroy_resources(void)
 {
+    canvas_restore_main();
+    shader_release_resources();
+    particle_clear_state();
+    tween_clear_state();
     if (g_draw.texture) {
         SDL_DestroyTexture(g_draw.texture);
         g_draw.texture = NULL;
@@ -3296,6 +4036,9 @@ static void destroy_resources(void)
     g_draw.pixels = NULL;
     g_draw.width = 0;
     g_draw.height = 0;
+    g_main_pixels = NULL;
+    g_main_width = 0;
+    g_main_height = 0;
     g_draw.initialized = 0;
     g_draw.open = 0;
     g_draw.has_dirty = 0;
@@ -3306,9 +4049,15 @@ static void destroy_resources(void)
     g_draw.has_prev_frame = 0;
     g_draw.frame_delta = 0.0;
     g_draw.alpha = 255;
+    g_draw.viewport_x = 0;
+    g_draw.viewport_y = 0;
+    g_draw.viewport_w = 0;
+    g_draw.viewport_h = 0;
+    g_draw.start_tick = 0;
 
     gamepad_shutdown();
     audio_close();
+    physics_clear_state();
 
     if (g_draw.sdl_owned) {
         SDL_Quit();
@@ -3346,55 +4095,35 @@ static int l_open(lua_State *L)
     }
 
     gamepad_init();
+    srand((unsigned int)SDL_GetTicks());
+    if (TTF_Init() != 0)
+        return luaL_error(L, "draw.open: TTF_Init failed: %s", TTF_GetError());
 
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     g_draw.window = SDL_CreateWindow(
         "Lua Draw",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
         (int)w,
         (int)h,
-        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
+    if (!g_draw.window) {
+        SDL_ClearError();
+        g_draw.window = SDL_CreateWindow(
+            "Lua Draw",
+            SDL_WINDOWPOS_CENTERED,
+            SDL_WINDOWPOS_CENTERED,
+            (int)w,
+            (int)h,
+            SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    }
     if (!g_draw.window) {
         destroy_resources();
         return luaL_error(L, "draw.open: cannot create window: %s",
                           SDL_GetError());
     }
-
-    g_draw.vsync = 0;
-    g_draw.renderer = SDL_CreateRenderer(
-        g_draw.window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (g_draw.renderer) {
-        g_draw.vsync = 1;
-    } else {
-        g_draw.renderer = SDL_CreateRenderer(
-            g_draw.window, -1, SDL_RENDERER_ACCELERATED);
-    }
-    if (!g_draw.renderer) {
-        g_draw.renderer = SDL_CreateRenderer(
-            g_draw.window, -1, SDL_RENDERER_SOFTWARE);
-    }
-    if (!g_draw.renderer) {
-        destroy_resources();
-        return luaL_error(L, "draw.open: cannot create renderer: %s",
-                          SDL_GetError());
-    }
-
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
-    SDL_RenderSetLogicalSize(g_draw.renderer, (int)w, (int)h);
-
-    g_draw.texture = SDL_CreateTexture(
-        g_draw.renderer,
-        SDL_PIXELFORMAT_ARGB8888,
-        SDL_TEXTUREACCESS_STREAMING,
-        (int)w,
-        (int)h);
-    if (!g_draw.texture) {
-        destroy_resources();
-        return luaL_error(L, "draw.open: cannot create texture: %s",
-                          SDL_GetError());
-    }
-    SDL_SetTextureBlendMode(g_draw.texture, SDL_BLENDMODE_BLEND);
 
     count = (size_t)w * (size_t)h;
     pixels = (uint32_t *)calloc(count, sizeof(uint32_t));
@@ -3402,14 +4131,75 @@ static int l_open(lua_State *L)
         destroy_resources();
         return luaL_error(L, "draw.open: out of memory");
     }
-
     g_draw.pixels = pixels;
     g_draw.width = (int)w;
     g_draw.height = (int)h;
+    g_main_pixels = pixels;
+    g_main_width = (int)w;
+    g_main_height = (int)h;
+    g_canvas_target = 0;
+    g_camera_x = 0.0;
+    g_camera_y = 0.0;
+
+    g_draw.vsync = 0;
+    g_draw.gl_context = SDL_GL_CreateContext(g_draw.window);
+    if (g_draw.gl_context) {
+        if (SDL_GL_MakeCurrent(g_draw.window, g_draw.gl_context) != 0) {
+            SDL_GL_DeleteContext(g_draw.gl_context);
+            g_draw.gl_context = NULL;
+        } else if (shader_load_functions() == 0 && shader_init_default() == 0) {
+            g_draw.gl_ready = 1;
+            if (SDL_GL_SetSwapInterval(1) < 0) {
+                SDL_GL_SetSwapInterval(0);
+            } else {
+                g_draw.vsync = 1;
+            }
+        } else {
+            shader_release_resources();
+        }
+    }
+    if (!g_draw.gl_ready) {
+        SDL_ClearError();
+        g_draw.renderer = SDL_CreateRenderer(
+            g_draw.window, -1,
+            SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (g_draw.renderer) {
+            g_draw.vsync = 1;
+        } else {
+            g_draw.renderer = SDL_CreateRenderer(
+                g_draw.window, -1, SDL_RENDERER_ACCELERATED);
+        }
+        if (!g_draw.renderer) {
+            g_draw.renderer = SDL_CreateRenderer(
+                g_draw.window, -1, SDL_RENDERER_SOFTWARE);
+        }
+        if (!g_draw.renderer) {
+            destroy_resources();
+            return luaL_error(L, "draw.open: cannot create renderer: %s",
+                              SDL_GetError());
+        }
+
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+        SDL_RenderSetLogicalSize(g_draw.renderer, (int)w, (int)h);
+        g_draw.texture = SDL_CreateTexture(
+            g_draw.renderer,
+            SDL_PIXELFORMAT_ARGB8888,
+            SDL_TEXTUREACCESS_STREAMING,
+            (int)w,
+            (int)h);
+        if (!g_draw.texture) {
+            destroy_resources();
+            return luaL_error(L, "draw.open: cannot create texture: %s",
+                              SDL_GetError());
+        }
+        SDL_SetTextureBlendMode(g_draw.texture, SDL_BLENDMODE_BLEND);
+    }
+
     g_draw.fps = (int)fps;
     g_draw.initialized = 1;
     g_draw.open = 1;
     g_draw.has_dirty = 0;
+    g_draw.start_tick = SDL_GetTicks();
 
     g_draw.last_tick = SDL_GetPerformanceCounter();
     g_draw.prev_frame = g_draw.last_tick;
@@ -4683,13 +5473,13 @@ static int l_getpixel(lua_State *L)
 
 static int l_width(lua_State *L)
 {
-    lua_pushinteger(L, g_draw.width);
+    lua_pushinteger(L, g_main_width);
     return 1;
 }
 
 static int l_height(lua_State *L)
 {
-    lua_pushinteger(L, g_draw.height);
+    lua_pushinteger(L, g_main_height);
     return 1;
 }
 
@@ -4980,6 +5770,157 @@ static int l_circle(lua_State *L)
 
     fill_circle((long long)x, (long long)y, (long long)radius,
                 fill, make_color(r, g, b, a));
+    return 0;
+}
+
+enum {
+    GRADIENT_VERTICAL,
+    GRADIENT_HORIZONTAL,
+    GRADIENT_DIAGONAL,
+    GRADIENT_RADIAL
+};
+
+static int parse_gradient_mode(lua_State *L, int index, const char *where)
+{
+    const char *mode = luaL_optstring(L, index, "vertical");
+
+    if (strcmp(mode, "vertical") == 0 || strcmp(mode, "v") == 0)
+        return GRADIENT_VERTICAL;
+    if (strcmp(mode, "horizontal") == 0 || strcmp(mode, "h") == 0)
+        return GRADIENT_HORIZONTAL;
+    if (strcmp(mode, "diagonal") == 0 || strcmp(mode, "d") == 0)
+        return GRADIENT_DIAGONAL;
+    if (strcmp(mode, "radial") == 0 || strcmp(mode, "r") == 0)
+        return GRADIENT_RADIAL;
+    return luaL_error(L, "%s: unknown gradient mode '%s'", where, mode);
+}
+
+static uint32_t gradient_mix(int r0, int g0, int b0, int a0,
+                             int r1, int g1, int b1, int a1, double t)
+{
+    double smooth;
+
+    if (t < 0.0)
+        t = 0.0;
+    if (t > 1.0)
+        t = 1.0;
+    smooth = t * t * (3.0 - 2.0 * t);
+    return make_color(
+        (int)(r0 + (r1 - r0) * smooth + 0.5),
+        (int)(g0 + (g1 - g0) * smooth + 0.5),
+        (int)(b0 + (b1 - b0) * smooth + 0.5),
+        (int)(a0 + (a1 - a0) * smooth + 0.5));
+}
+
+static void gradient_rect(long long x, long long y, long long w, long long h,
+                          int mode, int r0, int g0, int b0, int a0,
+                          int r1, int g1, int b1, int a1)
+{
+    long long x0, y0, x1, y1;
+    long long row;
+    double inv_w;
+    double inv_h;
+    double cx;
+    double cy;
+    double rx;
+    double ry;
+    double inv_radius;
+
+    if (w < 0) {
+        x += w;
+        w = -w;
+    }
+    if (h < 0) {
+        y += h;
+        h = -h;
+    }
+    if (w == 0 || h == 0)
+        return;
+
+    x0 = x;
+    y0 = y;
+    x1 = x + w;
+    y1 = y + h;
+    if (x0 < 0)
+        x0 = 0;
+    if (y0 < 0)
+        y0 = 0;
+    if (x1 > g_draw.width)
+        x1 = g_draw.width;
+    if (y1 > g_draw.height)
+        y1 = g_draw.height;
+    if (x0 >= x1 || y0 >= y1)
+        return;
+
+    inv_w = 1.0 / (double)w;
+    inv_h = 1.0 / (double)h;
+    cx = (double)x + (double)w * 0.5;
+    cy = (double)y + (double)h * 0.5;
+    rx = (double)w * 0.5;
+    ry = (double)h * 0.5;
+    if (rx < 1.0)
+        rx = 1.0;
+    if (ry < 1.0)
+        ry = 1.0;
+    inv_radius = 1.0 / sqrt(2.0);
+
+    for (row = y0; row < y1; ++row) {
+        uint32_t *dst = g_draw.pixels + (size_t)row * (size_t)g_draw.width;
+        long long col;
+
+        for (col = x0; col < x1; ++col) {
+            double t;
+
+            if (mode == GRADIENT_HORIZONTAL) {
+                t = ((double)col + 0.5 - (double)x) * inv_w;
+            } else if (mode == GRADIENT_DIAGONAL) {
+                double tx = ((double)col + 0.5 - (double)x) * inv_w;
+                double ty = ((double)row + 0.5 - (double)y) * inv_h;
+
+                t = (tx + ty) * 0.5;
+            } else if (mode == GRADIENT_RADIAL) {
+                double dx = ((double)col + 0.5 - cx) / rx;
+                double dy = ((double)row + 0.5 - cy) / ry;
+
+                t = sqrt(dx * dx + dy * dy) * inv_radius;
+            } else {
+                t = ((double)row + 0.5 - (double)y) * inv_h;
+            }
+            dst[col] = blend_color(
+                dst[col],
+                gradient_mix(r0, g0, b0, a0, r1, g1, b1, a1, t));
+        }
+    }
+    mark_dirty_rect((int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
+}
+
+static int l_gradient(lua_State *L)
+{
+    lua_Integer x, y, w, h;
+    int r0, g0, b0, a0;
+    int r1, g1, b1, a1;
+    int mode;
+
+    if (!ensure_open(L, "draw.gradient"))
+        return 0;
+
+    x = luaL_checkinteger(L, 1);
+    y = luaL_checkinteger(L, 2);
+    w = luaL_checkinteger(L, 3);
+    h = luaL_checkinteger(L, 4);
+    if (x < -1000000000LL || x > 1000000000LL ||
+        y < -1000000000LL || y > 1000000000LL ||
+        w < -1000000000LL || w > 1000000000LL ||
+        h < -1000000000LL || h > 1000000000LL)
+        return luaL_error(L, "draw.gradient: coordinates are too large");
+    if (read_color(L, 5, &r0, &g0, &b0, &a0) < 0)
+        return luaL_error(L, "draw.gradient: expected the first color");
+    if (read_color(L, 6, &r1, &g1, &b1, &a1) < 0)
+        return luaL_error(L, "draw.gradient: expected the second color");
+    mode = parse_gradient_mode(L, 7, "draw.gradient");
+
+    gradient_rect((long long)x, (long long)y, (long long)w, (long long)h,
+                  mode, r0, g0, b0, a0, r1, g1, b1, a1);
     return 0;
 }
 
@@ -6978,6 +7919,3572 @@ typedef struct {
     const char *description;
 } HelpEntry;
 
+#define PHYSICS_BODY_MAX 512
+#define PHYSICS_JOINT_MAX 256
+#define PHYSICS_CONTACT_MAX 1024
+#define PHYSICS_ITERATIONS 6
+#define PHYSICS_SLOP 0.01
+#define PHYSICS_CORRECTION 0.8
+#define PHYSICS_DENSITY 0.001
+#define PHYSICS_COORD_LIMIT 1000000000.0
+#define PHYSICS_SPEED_LIMIT 1000000.0
+#define PHYSICS_ANGULAR_LIMIT 12.56637061435917295385
+#define PHYSICS_REST_THRESHOLD 1.0
+
+typedef enum {
+    PHYSICS_CIRCLE = 0,
+    PHYSICS_BOX,
+    PHYSICS_TRIANGLE
+} PhysicsShapeKind;
+
+typedef enum {
+    PHYSICS_DYNAMIC = 0,
+    PHYSICS_STATIC,
+    PHYSICS_KINEMATIC
+} PhysicsBodyType;
+
+typedef struct {
+    double x, y;
+} PhysicsVec;
+
+typedef struct {
+    int used;
+    int id;
+    PhysicsShapeKind shape;
+    PhysicsBodyType type;
+    double x, y, angle;
+    double vx, vy, omega;
+    double fx, fy, torque;
+    double mass, inv_mass, inertia, inv_inertia;
+    double restitution, friction;
+    double linear_damping, angular_damping;
+    uint32_t category, mask;
+    int sensor;
+    double radius;
+    double half_w, half_h;
+    PhysicsVec verts[3];
+    char sprite[SPRITE_NAME_MAX];
+    double sprite_scale;
+    int has_sprite;
+    char color[PALETTE_NAME_MAX];
+    int has_color;
+} PhysicsBody;
+
+typedef struct {
+    int used;
+    int id;
+    int kind;
+    int a, b;
+    double rest, stiffness, damping;
+    PhysicsVec local_a, local_b;
+} PhysicsJoint;
+
+typedef struct {
+    int a, b;
+    double nx, ny, px, py, penetration;
+    double impulse, tangent_impulse, bias;
+    int sensor;
+} PhysicsContact;
+
+static PhysicsBody g_physics_bodies[PHYSICS_BODY_MAX];
+static PhysicsJoint g_physics_joints[PHYSICS_JOINT_MAX];
+static PhysicsContact g_physics_contacts[PHYSICS_CONTACT_MAX];
+static int g_physics_contact_count;
+static PhysicsVec g_physics_gravity;
+static int g_physics_callback = LUA_NOREF;
+
+static void physics_clear_state(void)
+{
+    memset(g_physics_bodies, 0, sizeof(g_physics_bodies));
+    memset(g_physics_joints, 0, sizeof(g_physics_joints));
+    memset(g_physics_contacts, 0, sizeof(g_physics_contacts));
+    g_physics_contact_count = 0;
+    g_physics_gravity.x = 0.0;
+    g_physics_gravity.y = 0.0;
+    tilemap_clear_bodyrefs();
+}
+
+static PhysicsVec physics_vec(double x, double y)
+{
+    PhysicsVec v;
+    v.x = x;
+    v.y = y;
+    return v;
+}
+
+static double physics_dot(PhysicsVec a, PhysicsVec b)
+{
+    return a.x * b.x + a.y * b.y;
+}
+
+static double physics_cross(PhysicsVec a, PhysicsVec b)
+{
+    return a.x * b.y - a.y * b.x;
+}
+
+static double physics_length(PhysicsVec v)
+{
+    return sqrt(physics_dot(v, v));
+}
+
+static int physics_normalize(PhysicsVec *v)
+{
+    double len = physics_length(*v);
+
+    if (!(len > 1e-12) || !isfinite(len))
+        return 0;
+    v->x /= len;
+    v->y /= len;
+    return 1;
+}
+
+static PhysicsVec physics_rotate(PhysicsVec v, double c, double s)
+{
+    return physics_vec(v.x * c - v.y * s, v.x * s + v.y * c);
+}
+
+static double physics_deg_to_rad(double deg)
+{
+    return deg * 0.017453292519943295769236907684886;
+}
+
+static int physics_rad_to_deg(double rad)
+{
+    double deg = rad * 57.295779513082320876798154814105;
+    if (deg >= 0.0)
+        return (int)(deg + 0.5);
+    return (int)(deg - 0.5);
+}
+
+static double physics_round(double v)
+{
+    if (v >= 0.0)
+        return floor(v + 0.5);
+    return ceil(v - 0.5);
+}
+
+static int physics_read_number_field(lua_State *L, int table,
+                                     const char *field, double fallback,
+                                     double *out, const char *where)
+{
+    lua_getfield(L, table, field);
+    if (lua_isnoneornil(L, -1)) {
+        lua_pop(L, 1);
+        *out = fallback;
+        return 0;
+    }
+    if (lua_type(L, -1) != LUA_TNUMBER) {
+        lua_pop(L, 1);
+        return luaL_error(L, "%s: %s must be a number", where, field);
+    }
+    *out = (double)lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    if (!isfinite(*out))
+        return luaL_error(L, "%s: %s must be finite", where, field);
+    return 0;
+}
+
+static int physics_read_bool_field(lua_State *L, int table,
+                                   const char *field, int fallback,
+                                   int *out, const char *where)
+{
+    lua_getfield(L, table, field);
+    if (lua_isnoneornil(L, -1)) {
+        lua_pop(L, 1);
+        *out = fallback;
+        return 0;
+    }
+    if (lua_type(L, -1) != LUA_TBOOLEAN) {
+        lua_pop(L, 1);
+        return luaL_error(L, "%s: %s must be a boolean", where, field);
+    }
+    *out = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    return 0;
+}
+
+static uint32_t physics_parse_u32_value(lua_State *L, int index,
+                                        uint32_t fallback,
+                                        const char *where, const char *field)
+{
+    lua_Integer value;
+
+    if (lua_isnoneornil(L, index))
+        return fallback;
+    if (lua_type(L, index) != LUA_TNUMBER)
+        return (uint32_t)luaL_error(L, "%s: %s must be an integer",
+                                    where, field);
+    value = lua_tointeger(L, index);
+    if (value < 0 || (unsigned long long)value > 0xffffffffULL)
+        return (uint32_t)luaL_error(L, "%s: %s must be 0..4294967295",
+                                    where, field);
+    return (uint32_t)value;
+}
+
+static int physics_read_u32_field(lua_State *L, int table,
+                                  const char *field, uint32_t fallback,
+                                  uint32_t *out, const char *where)
+{
+    lua_getfield(L, table, field);
+    *out = physics_parse_u32_value(L, -1, fallback, where, field);
+    lua_pop(L, 1);
+    return 0;
+}
+
+static PhysicsBody *physics_body_by_id(int id, const char *where)
+{
+    PhysicsBody *body;
+
+    if (id <= 0 || id > PHYSICS_BODY_MAX)
+        return NULL;
+    body = &g_physics_bodies[id - 1];
+    if (!body->used || body->id != id)
+        return NULL;
+    (void)where;
+    return body;
+}
+
+static PhysicsJoint *physics_joint_by_id(int id, const char *where)
+{
+    PhysicsJoint *joint;
+
+    if (id <= 0 || id > PHYSICS_JOINT_MAX)
+        return NULL;
+    joint = &g_physics_joints[id - 1];
+    if (!joint->used || joint->id != id)
+        return NULL;
+    (void)where;
+    return joint;
+}
+
+static void physics_body_vertices(PhysicsBody *body, PhysicsVec out[4],
+                                  int *count)
+{
+    double c = cos(body->angle);
+    double s = sin(body->angle);
+    int i;
+
+    if (body->shape == PHYSICS_BOX) {
+        PhysicsVec local[4];
+        local[0] = physics_vec(-body->half_w, -body->half_h);
+        local[1] = physics_vec(body->half_w, -body->half_h);
+        local[2] = physics_vec(body->half_w, body->half_h);
+        local[3] = physics_vec(-body->half_w, body->half_h);
+        for (i = 0; i < 4; ++i) {
+            PhysicsVec r = physics_rotate(local[i], c, s);
+            out[i] = physics_vec(body->x + r.x, body->y + r.y);
+        }
+        *count = 4;
+        return;
+    }
+    for (i = 0; i < 3; ++i) {
+        PhysicsVec r = physics_rotate(body->verts[i], c, s);
+        out[i] = physics_vec(body->x + r.x, body->y + r.y);
+    }
+    *count = 3;
+}
+
+static void physics_body_bounds(PhysicsBody *body,
+                                double *min_x, double *min_y,
+                                double *max_x, double *max_y)
+{
+    PhysicsVec verts[4];
+    int count;
+    int i;
+
+    if (body->shape == PHYSICS_CIRCLE) {
+        *min_x = body->x - body->radius;
+        *max_x = body->x + body->radius;
+        *min_y = body->y - body->radius;
+        *max_y = body->y + body->radius;
+        return;
+    }
+    physics_body_vertices(body, verts, &count);
+    *min_x = *max_x = verts[0].x;
+    *min_y = *max_y = verts[0].y;
+    for (i = 1; i < count; ++i) {
+        if (verts[i].x < *min_x) *min_x = verts[i].x;
+        if (verts[i].x > *max_x) *max_x = verts[i].x;
+        if (verts[i].y < *min_y) *min_y = verts[i].y;
+        if (verts[i].y > *max_y) *max_y = verts[i].y;
+    }
+}
+
+static double physics_shape_area(PhysicsBody *body)
+{
+    if (body->shape == PHYSICS_CIRCLE)
+        return 3.14159265358979323846 * body->radius * body->radius;
+    if (body->shape == PHYSICS_BOX)
+        return body->half_w * 2.0 * body->half_h * 2.0;
+    return fabs(physics_cross(
+        physics_vec(body->verts[1].x - body->verts[0].x,
+                    body->verts[1].y - body->verts[0].y),
+        physics_vec(body->verts[2].x - body->verts[0].x,
+                    body->verts[2].y - body->verts[0].y))) * 0.5;
+}
+
+static PhysicsVec physics_closest_on_segment(PhysicsVec p,
+                                             PhysicsVec a, PhysicsVec b)
+{
+    PhysicsVec ab = physics_vec(b.x - a.x, b.y - a.y);
+    double len2 = physics_dot(ab, ab);
+    double t;
+
+    if (len2 <= 1e-12)
+        return a;
+    t = physics_dot(physics_vec(p.x - a.x, p.y - a.y), ab) / len2;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    return physics_vec(a.x + ab.x * t, a.y + ab.y * t);
+}
+
+static int physics_point_in_poly(PhysicsVec p, PhysicsVec *verts, int count)
+{
+    int inside = 0;
+    int i;
+
+    for (i = 0; i < count; ++i) {
+        PhysicsVec a = verts[i];
+        PhysicsVec b = verts[(i + 1) % count];
+        if (((a.y > p.y) != (b.y > p.y)) &&
+            (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x))
+            inside = !inside;
+    }
+    return inside;
+}
+
+static PhysicsVec physics_poly_support(PhysicsVec *verts, int count,
+                                       PhysicsVec dir)
+{
+    PhysicsVec best = verts[0];
+    double best_dot = physics_dot(best, dir);
+    int i;
+
+    for (i = 1; i < count; ++i) {
+        double value = physics_dot(verts[i], dir);
+        if (value > best_dot) {
+            best_dot = value;
+            best = verts[i];
+        }
+    }
+    return best;
+}
+
+static int physics_collide_circles(PhysicsBody *a, PhysicsBody *b,
+                                   PhysicsContact *out)
+{
+    PhysicsVec delta = physics_vec(b->x - a->x, b->y - a->y);
+    double dist = physics_length(delta);
+    double radius = a->radius + b->radius;
+    double penetration;
+    PhysicsVec normal;
+
+    if (dist >= radius)
+        return 0;
+    if (!physics_normalize(&delta))
+        delta = physics_vec(1.0, 0.0);
+    normal = delta;
+    penetration = radius - dist;
+    out->nx = normal.x;
+    out->ny = normal.y;
+    out->px = a->x + normal.x * (a->radius - penetration * 0.5);
+    out->py = a->y + normal.y * (a->radius - penetration * 0.5);
+    out->penetration = penetration;
+    return 1;
+}
+
+static int physics_collide_polys(PhysicsBody *a, PhysicsBody *b,
+                                 PhysicsContact *out)
+{
+    PhysicsVec av[4], bv[4];
+    int an, bn;
+    double best = INFINITY;
+    PhysicsVec best_axis = physics_vec(0.0, 0.0);
+    int i;
+
+    physics_body_vertices(a, av, &an);
+    physics_body_vertices(b, bv, &bn);
+    for (i = 0; i < an + bn; ++i) {
+        PhysicsVec *verts = i < an ? av : bv;
+        int count = i < an ? an : bn;
+        int j = i < an ? i : i - an;
+        PhysicsVec edge = physics_vec(verts[(j + 1) % count].x - verts[j].x,
+                                      verts[(j + 1) % count].y - verts[j].y);
+        PhysicsVec axis = physics_vec(-edge.y, edge.x);
+        double min_a, max_a, min_b, max_b, overlap;
+        int k;
+
+        if (!physics_normalize(&axis))
+            continue;
+        min_a = max_a = physics_dot(av[0], axis);
+        min_b = max_b = physics_dot(bv[0], axis);
+        for (k = 1; k < an; ++k) {
+            double value = physics_dot(av[k], axis);
+            if (value < min_a) min_a = value;
+            if (value > max_a) max_a = value;
+        }
+        for (k = 1; k < bn; ++k) {
+            double value = physics_dot(bv[k], axis);
+            if (value < min_b) min_b = value;
+            if (value > max_b) max_b = value;
+        }
+        overlap = (max_a < max_b ? max_a : max_b) -
+                  (min_a > min_b ? min_a : min_b);
+        if (overlap <= 0.0)
+            return 0;
+        if (overlap < best) {
+            PhysicsVec centers = physics_vec(b->x - a->x, b->y - a->y);
+            best = overlap;
+            best_axis = axis;
+            if (physics_dot(centers, axis) < 0.0) {
+                best_axis.x = -axis.x;
+                best_axis.y = -axis.y;
+            }
+        }
+    }
+    if (!isfinite(best) || !physics_normalize(&best_axis))
+        return 0;
+    {
+        PhysicsVec tangent = physics_vec(-best_axis.y, best_axis.x);
+        PhysicsVec ca = physics_vec(a->x, a->y);
+        PhysicsVec cb = physics_vec(b->x, b->y);
+        PhysicsVec pa = physics_poly_support(av, an, best_axis);
+        PhysicsVec pb = physics_poly_support(bv, bn,
+                                              physics_vec(-best_axis.x,
+                                                          -best_axis.y));
+        double npos = (physics_dot(pa, best_axis) +
+                       physics_dot(pb, best_axis)) * 0.5;
+        double tpos = (physics_dot(ca, tangent) +
+                       physics_dot(cb, tangent)) * 0.5;
+        double amin = physics_dot(av[0], tangent);
+        double amax = amin;
+        double bmin = physics_dot(bv[0], tangent);
+        double bmax = bmin;
+        double lo, hi;
+        int k;
+
+        for (k = 1; k < an; ++k) {
+            double value = physics_dot(av[k], tangent);
+            if (value < amin) amin = value;
+            if (value > amax) amax = value;
+        }
+        for (k = 1; k < bn; ++k) {
+            double value = physics_dot(bv[k], tangent);
+            if (value < bmin) bmin = value;
+            if (value > bmax) bmax = value;
+        }
+        lo = amin > bmin ? amin : bmin;
+        hi = amax < bmax ? amax : bmax;
+        if (tpos < lo) tpos = lo;
+        if (tpos > hi) tpos = hi;
+        out->px = best_axis.x * npos + tangent.x * tpos;
+        out->py = best_axis.y * npos + tangent.y * tpos;
+    }
+    out->nx = best_axis.x;
+
+    out->ny = best_axis.y;
+    out->penetration = best;
+    return 1;
+}
+
+static int physics_collide_circle_poly(PhysicsBody *circle, PhysicsBody *poly,
+                                       PhysicsContact *out)
+{
+    PhysicsVec verts[4];
+    PhysicsVec closest;
+    PhysicsVec delta;
+    int count;
+    double best = INFINITY;
+    double dist;
+    int inside;
+    int i;
+
+    physics_body_vertices(poly, verts, &count);
+    closest = physics_closest_on_segment(
+        physics_vec(circle->x, circle->y), verts[0], verts[1]);
+    for (i = 0; i < count; ++i) {
+        PhysicsVec point = physics_closest_on_segment(
+            physics_vec(circle->x, circle->y), verts[i],
+            verts[(i + 1) % count]);
+        PhysicsVec d = physics_vec(point.x - circle->x,
+                                   point.y - circle->y);
+        double value = physics_dot(d, d);
+        if (value < best) {
+            best = value;
+            closest = point;
+        }
+    }
+    dist = sqrt(best);
+    inside = physics_point_in_poly(physics_vec(circle->x, circle->y),
+                                   verts, count);
+    if (!inside) {
+        if (dist >= circle->radius)
+            return 0;
+        delta = physics_vec(closest.x - circle->x, closest.y - circle->y);
+        out->penetration = circle->radius - dist;
+    } else {
+        delta = physics_vec(circle->x - closest.x, circle->y - closest.y);
+        out->penetration = circle->radius + dist;
+    }
+    if (!physics_normalize(&delta))
+        delta = physics_vec(1.0, 0.0);
+    out->nx = delta.x;
+    out->ny = delta.y;
+    out->px = closest.x;
+    out->py = closest.y;
+    return 1;
+}
+
+static int physics_collide_pair(PhysicsBody *a, PhysicsBody *b,
+                                PhysicsContact *out)
+{
+    int result;
+
+    memset(out, 0, sizeof(*out));
+    out->a = a->id;
+    out->b = b->id;
+    out->sensor = a->sensor || b->sensor;
+    if (a->shape == PHYSICS_CIRCLE && b->shape == PHYSICS_CIRCLE)
+        result = physics_collide_circles(a, b, out);
+    else if (a->shape != PHYSICS_CIRCLE && b->shape != PHYSICS_CIRCLE)
+        result = physics_collide_polys(a, b, out);
+    else if (a->shape == PHYSICS_CIRCLE)
+        result = physics_collide_circle_poly(a, b, out);
+    else {
+        result = physics_collide_circle_poly(b, a, out);
+        out->nx = -out->nx;
+        out->ny = -out->ny;
+    }
+    return result;
+}
+
+static int physics_can_collide(PhysicsBody *a, PhysicsBody *b)
+{
+    if (!a->sensor && !b->sensor && a->inv_mass == 0.0 &&
+        b->inv_mass == 0.0)
+        return 0;
+    return ((a->category & b->mask) != 0 && (b->category & a->mask) != 0);
+}
+
+static int physics_store_contact(PhysicsContact *contact)
+{
+    if (g_physics_contact_count >= PHYSICS_CONTACT_MAX)
+        return 0;
+    g_physics_contacts[g_physics_contact_count++] = *contact;
+    return 1;
+}
+
+static void physics_detect_contacts(void)
+{
+    int i, j;
+
+    for (i = 0; i < PHYSICS_BODY_MAX; ++i) {
+        PhysicsBody *a = &g_physics_bodies[i];
+        double ax0, ay0, ax1, ay1;
+
+        if (!a->used)
+            continue;
+        physics_body_bounds(a, &ax0, &ay0, &ax1, &ay1);
+        for (j = i + 1; j < PHYSICS_BODY_MAX; ++j) {
+            PhysicsBody *b = &g_physics_bodies[j];
+            double bx0, by0, bx1, by1;
+            PhysicsContact contact;
+
+            if (!b->used || !physics_can_collide(a, b))
+                continue;
+            physics_body_bounds(b, &bx0, &by0, &bx1, &by1);
+            if (ax1 < bx0 || bx1 < ax0 || ay1 < by0 || by1 < ay0)
+                continue;
+            if (physics_collide_pair(a, b, &contact))
+                physics_store_contact(&contact);
+        }
+    }
+}
+
+static void physics_apply_impulse(PhysicsBody *body, PhysicsVec impulse,
+                                  PhysicsVec r)
+{
+    body->vx += impulse.x * body->inv_mass;
+    body->vy += impulse.y * body->inv_mass;
+    body->omega += physics_cross(r, impulse) * body->inv_inertia;
+}
+
+static void physics_prepare_contact(PhysicsContact *contact)
+{
+    PhysicsBody *a = physics_body_by_id(contact->a, "draw.physicsstep");
+    PhysicsBody *b = physics_body_by_id(contact->b, "draw.physicsstep");
+    PhysicsVec n, ra, rb, rv;
+    double vel, restitution;
+
+    contact->impulse = 0.0;
+    contact->tangent_impulse = 0.0;
+    contact->bias = 0.0;
+    if (!a || !b || contact->sensor)
+        return;
+    n = physics_vec(contact->nx, contact->ny);
+    ra = physics_vec(contact->px - a->x, contact->py - a->y);
+    rb = physics_vec(contact->px - b->x, contact->py - b->y);
+    rv = physics_vec(
+        b->vx - b->omega * rb.y - a->vx + a->omega * ra.y,
+        b->vy + b->omega * rb.x - a->vy - a->omega * ra.x);
+    vel = physics_dot(rv, n);
+    restitution = a->restitution > b->restitution
+                      ? a->restitution : b->restitution;
+    if (vel < -PHYSICS_REST_THRESHOLD)
+        contact->bias = -restitution * vel;
+}
+
+static void physics_solve_contact(PhysicsContact *contact)
+{
+    PhysicsBody *a = physics_body_by_id(contact->a, "draw.physicsstep");
+    PhysicsBody *b = physics_body_by_id(contact->b, "draw.physicsstep");
+    PhysicsVec n, ra, rb, rv, tangent;
+    double ra_cross_n, rb_cross_n;
+    double inv_mass, denom;
+    double vel, impulse, delta_impulse;
+    double mu, limit;
+
+    if (!a || !b || contact->sensor)
+        return;
+    n = physics_vec(contact->nx, contact->ny);
+    ra = physics_vec(contact->px - a->x, contact->py - a->y);
+    rb = physics_vec(contact->px - b->x, contact->py - b->y);
+    inv_mass = a->inv_mass + b->inv_mass;
+    if (inv_mass <= 0.0)
+        return;
+
+    rv = physics_vec(
+        b->vx - b->omega * rb.y - a->vx + a->omega * ra.y,
+        b->vy + b->omega * rb.x - a->vy - a->omega * ra.x);
+    vel = physics_dot(rv, n);
+    ra_cross_n = physics_cross(ra, n);
+    rb_cross_n = physics_cross(rb, n);
+    denom = inv_mass +
+            ra_cross_n * ra_cross_n * a->inv_inertia +
+            rb_cross_n * rb_cross_n * b->inv_inertia;
+    if (denom <= 0.0)
+        return;
+    impulse = contact->impulse + (-vel + contact->bias) / denom;
+    if (impulse < 0.0)
+        impulse = 0.0;
+    delta_impulse = impulse - contact->impulse;
+    contact->impulse = impulse;
+    physics_apply_impulse(a, physics_vec(-n.x * delta_impulse,
+                                         -n.y * delta_impulse), ra);
+    physics_apply_impulse(b, physics_vec(n.x * delta_impulse,
+                                         n.y * delta_impulse), rb);
+
+    rv = physics_vec(
+        b->vx - b->omega * rb.y - a->vx + a->omega * ra.y,
+        b->vy + b->omega * rb.x - a->vy - a->omega * ra.x);
+    tangent = physics_vec(rv.x - n.x * physics_dot(rv, n),
+                          rv.y - n.y * physics_dot(rv, n));
+    if (!physics_normalize(&tangent))
+        return;
+    ra_cross_n = physics_cross(ra, tangent);
+    rb_cross_n = physics_cross(rb, tangent);
+    denom = inv_mass +
+            ra_cross_n * ra_cross_n * a->inv_inertia +
+            rb_cross_n * rb_cross_n * b->inv_inertia;
+    if (denom <= 0.0)
+        return;
+    impulse = contact->tangent_impulse - physics_dot(rv, tangent) / denom;
+    mu = sqrt(a->friction * b->friction);
+    limit = mu * contact->impulse;
+    if (impulse > limit)
+        impulse = limit;
+    if (impulse < -limit)
+        impulse = -limit;
+    delta_impulse = impulse - contact->tangent_impulse;
+    contact->tangent_impulse = impulse;
+    physics_apply_impulse(a, physics_vec(-tangent.x * delta_impulse,
+                                         -tangent.y * delta_impulse), ra);
+    physics_apply_impulse(b, physics_vec(tangent.x * delta_impulse,
+                                         tangent.y * delta_impulse), rb);
+}
+
+static void physics_correct_contacts(int start)
+{
+    int i;
+
+    for (i = start; i < g_physics_contact_count; ++i) {
+        PhysicsContact *contact = &g_physics_contacts[i];
+        PhysicsBody *a = physics_body_by_id(contact->a, "draw.physicsstep");
+        PhysicsBody *b = physics_body_by_id(contact->b, "draw.physicsstep");
+        PhysicsVec n;
+        double inv_mass, separation, correction;
+
+        if (!a || !b || contact->sensor)
+            continue;
+        n = physics_vec(contact->nx, contact->ny);
+        inv_mass = a->inv_mass + b->inv_mass;
+        if (inv_mass <= 0.0)
+            continue;
+        separation = contact->penetration - PHYSICS_SLOP;
+        if (separation <= 0.0)
+            continue;
+        correction = separation * PHYSICS_CORRECTION / inv_mass;
+        a->x -= n.x * correction * a->inv_mass;
+        a->y -= n.y * correction * a->inv_mass;
+        b->x += n.x * correction * b->inv_mass;
+        b->y += n.y * correction * b->inv_mass;
+    }
+}
+
+static PhysicsVec physics_local_to_world(PhysicsBody *body, PhysicsVec local)
+{
+    double c = cos(body->angle);
+    double s = sin(body->angle);
+    PhysicsVec r = physics_rotate(local, c, s);
+    return physics_vec(body->x + r.x, body->y + r.y);
+}
+
+static void physics_solve_joint(PhysicsJoint *joint)
+{
+    PhysicsBody *a = physics_body_by_id(joint->a, "draw.physicsstep");
+    PhysicsBody *b = physics_body_by_id(joint->b, "draw.physicsstep");
+    PhysicsVec pa, pb, delta, normal, rel;
+    double dist, diff, inv_mass, force, correction;
+
+    if (!a || !b)
+        return;
+    if (joint->kind == 2) {
+        PhysicsVec wa = physics_local_to_world(a, joint->local_a);
+        PhysicsVec wb = physics_local_to_world(b, joint->local_b);
+        PhysicsVec correction = physics_vec((wb.x - wa.x) * joint->stiffness,
+                                            (wb.y - wa.y) * joint->stiffness);
+        double sum = a->inv_mass + b->inv_mass + a->inv_inertia +
+                     b->inv_inertia;
+        double la = physics_cross(joint->local_a, correction);
+        double lb = physics_cross(joint->local_b, correction);
+
+        if (sum <= 0.0)
+            return;
+        a->x += correction.x * a->inv_mass / sum;
+        a->y += correction.y * a->inv_mass / sum;
+        b->x -= correction.x * b->inv_mass / sum;
+        b->y -= correction.y * b->inv_mass / sum;
+        a->angle += la * a->inv_inertia / sum;
+        b->angle -= lb * b->inv_inertia / sum;
+        rel = physics_vec(
+            b->vx - b->omega * (wb.y - b->y) - a->vx +
+                a->omega * (wa.y - a->y),
+            b->vy + b->omega * (wb.x - b->x) - a->vy -
+                a->omega * (wa.x - a->x));
+        a->vx += rel.x * joint->damping * a->inv_mass;
+        a->vy += rel.y * joint->damping * a->inv_mass;
+        b->vx -= rel.x * joint->damping * b->inv_mass;
+        b->vy -= rel.y * joint->damping * b->inv_mass;
+        return;
+    }
+
+    pa = physics_vec(a->x, a->y);
+    pb = physics_vec(b->x, b->y);
+    delta = physics_vec(pb.x - pa.x, pb.y - pa.y);
+    dist = physics_length(delta);
+    if (!physics_normalize(&delta))
+        delta = physics_vec(1.0, 0.0);
+    normal = delta;
+    diff = dist - joint->rest;
+    rel = physics_vec(b->vx - a->vx, b->vy - a->vy);
+
+    if (joint->kind == 1) {
+        force = joint->stiffness * diff +
+                joint->damping * physics_dot(rel, normal);
+        a->fx += force * normal.x;
+        a->fy += force * normal.y;
+        b->fx -= force * normal.x;
+        b->fy -= force * normal.y;
+        return;
+    }
+
+    inv_mass = a->inv_mass + b->inv_mass;
+    if (inv_mass <= 0.0)
+        return;
+    correction = diff * joint->stiffness / inv_mass;
+    a->x += normal.x * correction * a->inv_mass;
+    a->y += normal.y * correction * a->inv_mass;
+    b->x -= normal.x * correction * b->inv_mass;
+    b->y -= normal.y * correction * b->inv_mass;
+    force = physics_dot(rel, normal) * joint->damping / inv_mass;
+    a->vx += normal.x * force * a->inv_mass;
+    a->vy += normal.y * force * a->inv_mass;
+    b->vx -= normal.x * force * b->inv_mass;
+    b->vy -= normal.y * force * b->inv_mass;
+}
+
+static void physics_clamp_body(PhysicsBody *body)
+{
+    if (!isfinite(body->x) || !isfinite(body->y)) {
+        body->x = 0.0;
+        body->y = 0.0;
+        body->vx = 0.0;
+        body->vy = 0.0;
+        body->omega = 0.0;
+    }
+    if (!isfinite(body->vx)) body->vx = 0.0;
+    if (!isfinite(body->vy)) body->vy = 0.0;
+    if (!isfinite(body->omega)) body->omega = 0.0;
+    if (!isfinite(body->angle)) body->angle = 0.0;
+    if (body->vx > PHYSICS_SPEED_LIMIT) body->vx = PHYSICS_SPEED_LIMIT;
+    if (body->vx < -PHYSICS_SPEED_LIMIT) body->vx = -PHYSICS_SPEED_LIMIT;
+    if (body->vy > PHYSICS_SPEED_LIMIT) body->vy = PHYSICS_SPEED_LIMIT;
+    if (body->vy < -PHYSICS_SPEED_LIMIT) body->vy = -PHYSICS_SPEED_LIMIT;
+    if (body->omega > PHYSICS_ANGULAR_LIMIT)
+        body->omega = PHYSICS_ANGULAR_LIMIT;
+    if (body->omega < -PHYSICS_ANGULAR_LIMIT)
+        body->omega = -PHYSICS_ANGULAR_LIMIT;
+}
+
+static void physics_integrate(double dt)
+{
+    int i;
+
+    for (i = 0; i < PHYSICS_BODY_MAX; ++i) {
+        PhysicsBody *body = &g_physics_bodies[i];
+        double linear_scale;
+        double angular_scale;
+
+        if (!body->used || body->inv_mass == 0.0)
+            continue;
+        body->vx += (g_physics_gravity.x + body->fx * body->inv_mass) * dt;
+        body->vy += (g_physics_gravity.y + body->fy * body->inv_mass) * dt;
+        body->omega += body->torque * body->inv_inertia * dt;
+        linear_scale = 1.0 / (1.0 + body->linear_damping * dt);
+        angular_scale = 1.0 / (1.0 + body->angular_damping * dt);
+        body->vx *= linear_scale;
+        body->vy *= linear_scale;
+        body->omega *= angular_scale;
+        physics_clamp_body(body);
+        body->x += body->vx * dt;
+        body->y += body->vy * dt;
+        body->angle += body->omega * dt;
+        body->fx = 0.0;
+        body->fy = 0.0;
+        body->torque = 0.0;
+    }
+}
+
+static int physics_parse_body(lua_State *L, int index, PhysicsBody *body)
+{
+    const char *where = "draw.physicsbody";
+    const char *type_name;
+    const char *sprite_name;
+    double density;
+    double mass;
+    double scale;
+    int sprite_index;
+    size_t name_len;
+    int shape_index;
+    int i;
+
+    if (lua_type(L, index) != LUA_TTABLE)
+        return luaL_error(L, "%s: expected a table", where);
+    memset(body, 0, sizeof(*body));
+    body->type = PHYSICS_DYNAMIC;
+    body->restitution = 0.0;
+    body->friction = 0.5;
+    body->category = 0xffffffffU;
+    body->mask = 0xffffffffU;
+    body->sprite_scale = 1.0;
+
+    lua_getfield(L, index, "type");
+    if (!lua_isnoneornil(L, -1)) {
+        if (lua_type(L, -1) != LUA_TSTRING) {
+            lua_pop(L, 1);
+            return luaL_error(L, "%s: type must be a string", where);
+        }
+        type_name = lua_tostring(L, -1);
+        if (strcmp(type_name, "dynamic") == 0)
+            body->type = PHYSICS_DYNAMIC;
+        else if (strcmp(type_name, "static") == 0)
+            body->type = PHYSICS_STATIC;
+        else if (strcmp(type_name, "kinematic") == 0)
+            body->type = PHYSICS_KINEMATIC;
+        else {
+            lua_pop(L, 1);
+            return luaL_error(L,
+                "%s: type must be dynamic, static, or kinematic", where);
+        }
+    }
+    lua_pop(L, 1);
+
+    if (physics_read_number_field(L, index, "x", 0.0, &body->x, where) ||
+        physics_read_number_field(L, index, "y", 0.0, &body->y, where) ||
+        physics_read_number_field(L, index, "angle", 0.0, &body->angle, where) ||
+        physics_read_number_field(L, index, "vx", 0.0, &body->vx, where) ||
+        physics_read_number_field(L, index, "vy", 0.0, &body->vy, where) ||
+        physics_read_number_field(L, index, "omega", 0.0, &body->omega, where) ||
+        physics_read_number_field(L, index, "restitution", 0.0,
+                                  &body->restitution, where) ||
+        physics_read_number_field(L, index, "friction", 0.5,
+                                  &body->friction, where) ||
+        physics_read_number_field(L, index, "lineardamping", 0.0,
+                                  &body->linear_damping, where) ||
+        physics_read_number_field(L, index, "angulardamping", 0.0,
+                                  &body->angular_damping, where) ||
+        physics_read_number_field(L, index, "density", PHYSICS_DENSITY,
+                                  &density, where) ||
+        physics_read_number_field(L, index, "mass", -1.0, &mass, where) ||
+        physics_read_number_field(L, index, "scale", 1.0, &scale, where))
+        return luaL_error(L, "%s: invalid value", where);
+    if (fabs(body->x) > PHYSICS_COORD_LIMIT ||
+        fabs(body->y) > PHYSICS_COORD_LIMIT ||
+        fabs(body->vx) > PHYSICS_SPEED_LIMIT ||
+        fabs(body->vy) > PHYSICS_SPEED_LIMIT ||
+        fabs(body->omega) > 100000.0)
+        return luaL_error(L, "%s: position or velocity is too large", where);
+    if (body->restitution < 0.0 || body->restitution > 1.0)
+        return luaL_error(L, "%s: restitution must be 0..1", where);
+    if (body->friction < 0.0 || body->friction > 1000.0)
+        return luaL_error(L, "%s: friction must be 0..1000", where);
+    if (body->linear_damping < 0.0 || body->angular_damping < 0.0 ||
+        density <= 0.0 || scale < 1.0 || scale > 1000000.0)
+        return luaL_error(L, "%s: invalid body parameters", where);
+    if (physics_read_bool_field(L, index, "sensor", 0, &body->sensor, where) ||
+        physics_read_u32_field(L, index, "category", 0xffffffffU,
+                               &body->category, where) ||
+        physics_read_u32_field(L, index, "mask", 0xffffffffU,
+                               &body->mask, where))
+        return luaL_error(L, "%s: invalid filter", where);
+    lua_getfield(L, index, "color");
+    if (!lua_isnoneornil(L, -1)) {
+        if (lua_type(L, -1) != LUA_TSTRING) {
+            lua_pop(L, 1);
+            return luaL_error(L, "%s: color must be a palette name", where);
+        }
+        name_len = strlen(lua_tostring(L, -1));
+        if (name_len >= sizeof(body->color)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "%s: color name is too long", where);
+        }
+        strcpy(body->color, lua_tostring(L, -1));
+        body->has_color = 1;
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, index, "circle");
+    if (!lua_isnoneornil(L, -1)) {
+        shape_index = lua_gettop(L);
+        if (lua_type(L, shape_index) != LUA_TTABLE) {
+            lua_pop(L, 1);
+            return luaL_error(L, "%s: circle must be a table", where);
+        }
+        if (physics_read_number_field(L, shape_index, "radius", -1.0,
+                                      &body->radius, where))
+            return luaL_error(L, "%s: invalid radius", where);
+        lua_pop(L, 1);
+        if (body->radius <= 0.0 || body->radius > PHYSICS_COORD_LIMIT)
+            return luaL_error(L, "%s: radius must be positive", where);
+        body->shape = PHYSICS_CIRCLE;
+    } else {
+        lua_pop(L, 1);
+        lua_getfield(L, index, "box");
+        if (!lua_isnoneornil(L, -1)) {
+            double width, height;
+
+            shape_index = lua_gettop(L);
+            if (lua_type(L, shape_index) != LUA_TTABLE) {
+                lua_pop(L, 1);
+                return luaL_error(L, "%s: box must be a table", where);
+            }
+            if (physics_read_number_field(L, shape_index, "width", -1.0,
+                                          &width, where) ||
+                physics_read_number_field(L, shape_index, "height", -1.0,
+                                          &height, where)) {
+                lua_pop(L, 1);
+                return luaL_error(L, "%s: invalid box size", where);
+            }
+            lua_pop(L, 1);
+            if (width <= 0.0 || height <= 0.0 ||
+                width > PHYSICS_COORD_LIMIT || height > PHYSICS_COORD_LIMIT)
+                return luaL_error(L, "%s: box size must be positive", where);
+            body->half_w = width * 0.5;
+            body->half_h = height * 0.5;
+            body->shape = PHYSICS_BOX;
+        } else {
+            lua_pop(L, 1);
+            lua_getfield(L, index, "sprite");
+            if (!lua_isnoneornil(L, -1)) {
+                SpriteEntry *sprite;
+
+                if (lua_type(L, -1) != LUA_TSTRING) {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "%s: sprite must be a name", where);
+                }
+                name_len = strlen(lua_tostring(L, -1));
+                if (name_len == 0 || name_len >= sizeof(body->sprite)) {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "%s: sprite name is invalid", where);
+                }
+                sprite_name = lua_tostring(L, -1);
+                sprite_index = find_sprite_name(sprite_name);
+                if (sprite_index < 0) {
+                    lua_pop(L, 1);
+                    return luaL_error(L,
+                        "%s: sprite '%s' is not defined", where,
+                        sprite_name);
+                }
+                strcpy(body->sprite, sprite_name);
+                lua_pop(L, 1);
+                sprite = &g_sprites[sprite_index];
+                body->half_w = (double)sprite->width * scale * 0.5;
+                body->half_h = (double)sprite->height * scale * 0.5;
+                body->sprite_scale = scale;
+                body->has_sprite = 1;
+                body->shape = PHYSICS_BOX;
+            } else {
+                lua_pop(L, 1);
+                lua_getfield(L, index, "triangle");
+                if (lua_isnoneornil(L, -1)) {
+                    lua_pop(L, 1);
+                    return luaL_error(L,
+                        "%s: expected circle, box, sprite, or triangle",
+                        where);
+                }
+                shape_index = lua_gettop(L);
+                if (lua_type(L, shape_index) != LUA_TTABLE) {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "%s: triangle must be a table",
+                                      where);
+                }
+                lua_rawgeti(L, shape_index, 1);
+                if (lua_isnumber(L, -1)) {
+                    for (i = 0; i < 6; ++i) {
+                        lua_Number value;
+
+                        lua_rawgeti(L, shape_index, i + 1);
+                        if (lua_type(L, -1) != LUA_TNUMBER) {
+                            lua_pop(L, 2);
+                            return luaL_error(L,
+                                "%s: triangle needs 6 numbers", where);
+                        }
+                        value = lua_tonumber(L, -1);
+                        lua_pop(L, 1);
+                        if (!isfinite(value) ||
+                            fabs(value) > PHYSICS_COORD_LIMIT)
+                            return luaL_error(L,
+                                "%s: triangle coordinate is invalid", where);
+                        if (i % 2 == 0)
+                            body->verts[i / 2].x = (double)value;
+                        else
+                            body->verts[i / 2].y = (double)value;
+                    }
+                    lua_pop(L, 1);
+                } else {
+                    const char *fields[6] = {"x1", "y1", "x2", "y2",
+                                             "x3", "y3"};
+                    double values[6];
+
+                    lua_pop(L, 1);
+                    for (i = 0; i < 6; ++i) {
+                        if (physics_read_number_field(L, shape_index,
+                            fields[i], 0.0, &values[i], where))
+                            return luaL_error(L,
+                                "%s: triangle coordinate is invalid", where);
+                        if (fabs(values[i]) > PHYSICS_COORD_LIMIT)
+                            return luaL_error(L,
+                                "%s: triangle coordinate is invalid", where);
+                    }
+                    for (i = 0; i < 3; ++i)
+                        body->verts[i] = physics_vec(values[i * 2],
+                                                     values[i * 2 + 1]);
+                }
+                lua_pop(L, 1);
+                if (physics_shape_area(body) <= 1e-9)
+                    return luaL_error(L, "%s: triangle is degenerate", where);
+                body->shape = PHYSICS_TRIANGLE;
+            }
+        }
+    }
+
+    body->angle = physics_deg_to_rad(body->angle);
+    body->omega = physics_deg_to_rad(body->omega);
+    if (mass < 0.0)
+        mass = physics_shape_area(body) * density;
+    if (!isfinite(mass) || mass <= 0.0)
+        mass = 0.001;
+    body->mass = mass;
+    if (body->type == PHYSICS_DYNAMIC) {
+        body->inv_mass = 1.0 / mass;
+        if (body->shape == PHYSICS_CIRCLE)
+            body->inertia = 0.5 * mass * body->radius * body->radius;
+        else if (body->shape == PHYSICS_BOX)
+            body->inertia = mass *
+                ((2.0 * body->half_w) * (2.0 * body->half_w) +
+                 (2.0 * body->half_h) * (2.0 * body->half_h)) / 12.0;
+        else {
+            double max_d2 = 0.0;
+            for (i = 0; i < 3; ++i) {
+                PhysicsVec v = body->verts[i];
+                double d2 = physics_dot(v, v);
+                if (d2 > max_d2)
+                    max_d2 = d2;
+            }
+            body->inertia = mass * fmax(max_d2, 1.0);
+        }
+        if (body->inertia > 0.0)
+            body->inv_inertia = 1.0 / body->inertia;
+    }
+    return 0;
+}
+
+static int physics_alloc_body(void)
+{
+    int i;
+
+    for (i = 0; i < PHYSICS_BODY_MAX; ++i) {
+        if (!g_physics_bodies[i].used) {
+            g_physics_bodies[i].id = i + 1;
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+static int physics_alloc_joint(void)
+{
+    int i;
+
+    for (i = 0; i < PHYSICS_JOINT_MAX; ++i) {
+        if (!g_physics_joints[i].used) {
+            g_physics_joints[i].id = i + 1;
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+static PhysicsBody *physics_check_body(lua_State *L, int index)
+{
+    int id = (int)luaL_checkinteger(L, index);
+    PhysicsBody *body = physics_body_by_id(id, "draw.physics");
+
+    if (!body)
+        luaL_error(L, "draw.physics: body %d is not defined", id);
+    return body;
+}
+
+static int physics_call_callback(lua_State *L, PhysicsContact *contact)
+{
+    if (g_physics_callback == LUA_NOREF)
+        return 0;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, g_physics_callback);
+    lua_pushinteger(L, contact->a);
+    lua_pushinteger(L, contact->b);
+    lua_pushnumber(L, contact->px);
+    lua_pushnumber(L, contact->py);
+    lua_pushnumber(L, contact->nx);
+    lua_pushnumber(L, contact->ny);
+    lua_pushboolean(L, contact->sensor);
+    if (lua_pcall(L, 7, 0, 0) != 0)
+        return luaL_error(L, "draw.physicsstep: callback error: %s",
+                          lua_tostring(L, -1));
+    return 0;
+}
+
+static int l_physicsworld(lua_State *L)
+{
+    if (!lua_isnoneornil(L, 1)) {
+        double x = luaL_checknumber(L, 1);
+        double y = luaL_checknumber(L, 2);
+
+        if (!isfinite(x) || !isfinite(y) || fabs(x) > PHYSICS_SPEED_LIMIT ||
+            fabs(y) > PHYSICS_SPEED_LIMIT)
+            return luaL_error(L, "draw.physicsworld: invalid gravity");
+        g_physics_gravity.x = x;
+        g_physics_gravity.y = y;
+    }
+    lua_pushnumber(L, g_physics_gravity.x);
+    lua_pushnumber(L, g_physics_gravity.y);
+    return 2;
+}
+
+static int l_physicsclear(lua_State *L)
+{
+    physics_clear_state();
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_physicsbody(lua_State *L)
+{
+    PhysicsBody tmp;
+    PhysicsBody *body;
+    int id;
+
+    if (physics_parse_body(L, 1, &tmp) != 0)
+        return luaL_error(L, "draw.physicsbody: invalid body");
+    id = physics_alloc_body();
+    if (id == 0)
+        return luaL_error(L, "draw.physicsbody: too many bodies (max %d)",
+                          PHYSICS_BODY_MAX);
+    body = &g_physics_bodies[id - 1];
+    *body = tmp;
+    body->id = id;
+    body->used = 1;
+    lua_pushinteger(L, id);
+    return 1;
+}
+
+static int l_physicsstep(lua_State *L)
+{
+    double dt = luaL_optnumber(L, 1, -1.0);
+    int substep;
+    int i;
+
+    if (dt < 0.0)
+        dt = g_draw.frame_delta;
+    if (!isfinite(dt))
+        return luaL_error(L, "draw.physicsstep: dt must be finite");
+    if (dt <= 0.0) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    if (dt > 1.0 / 30.0)
+        dt = 1.0 / 30.0;
+    g_physics_contact_count = 0;
+    for (substep = 0; substep < 2; ++substep) {
+        double h = dt * 0.5;
+        int base = g_physics_contact_count;
+        int iter;
+
+        physics_integrate(h);
+        physics_detect_contacts();
+        for (i = base; i < g_physics_contact_count; ++i)
+            physics_prepare_contact(&g_physics_contacts[i]);
+        for (iter = 0; iter < PHYSICS_ITERATIONS; ++iter) {
+            for (i = 0; i < PHYSICS_JOINT_MAX; ++i) {
+                if (g_physics_joints[i].used)
+                    physics_solve_joint(&g_physics_joints[i]);
+            }
+            for (i = base; i < g_physics_contact_count; ++i)
+                physics_solve_contact(&g_physics_contacts[i]);
+        }
+        physics_correct_contacts(base);
+        for (i = 0; i < PHYSICS_BODY_MAX; ++i) {
+            if (g_physics_bodies[i].used)
+                physics_clamp_body(&g_physics_bodies[i]);
+        }
+    }
+    for (i = 0; i < g_physics_contact_count; ++i) {
+        if (physics_call_callback(L, &g_physics_contacts[i]) != 0)
+            return 0;
+    }
+    lua_pushinteger(L, g_physics_contact_count);
+    return 1;
+}
+
+static int l_physicsposition(lua_State *L)
+{
+    PhysicsBody *body = physics_check_body(L, 1);
+
+    lua_pushnumber(L, body->x);
+    lua_pushnumber(L, body->y);
+    lua_pushnumber(L, body->angle * 57.295779513082320876798154814105);
+    return 3;
+}
+
+static int l_physicsvelocity(lua_State *L)
+{
+    PhysicsBody *body = physics_check_body(L, 1);
+
+    lua_pushnumber(L, body->vx);
+    lua_pushnumber(L, body->vy);
+    lua_pushnumber(L, body->omega * 57.295779513082320876798154814105);
+    return 3;
+}
+
+static int l_physicssetposition(lua_State *L)
+{
+    PhysicsBody *body = physics_check_body(L, 1);
+    double x = luaL_checknumber(L, 2);
+    double y = luaL_checknumber(L, 3);
+    double angle = luaL_optnumber(L, 4,
+        body->angle * 57.295779513082320876798154814105);
+
+    if (!isfinite(x) || !isfinite(y) || !isfinite(angle) ||
+        fabs(x) > PHYSICS_COORD_LIMIT || fabs(y) > PHYSICS_COORD_LIMIT)
+        return luaL_error(L, "draw.physicssetposition: invalid value");
+    body->x = x;
+    body->y = y;
+    body->angle = physics_deg_to_rad(angle);
+    return 0;
+}
+
+static int l_physicssetvelocity(lua_State *L)
+{
+    PhysicsBody *body = physics_check_body(L, 1);
+    double vx = luaL_checknumber(L, 2);
+    double vy = luaL_checknumber(L, 3);
+    double omega = luaL_optnumber(L, 4,
+        body->omega * 57.295779513082320876798154814105);
+
+    if (!isfinite(vx) || !isfinite(vy) || !isfinite(omega) ||
+        fabs(vx) > PHYSICS_SPEED_LIMIT || fabs(vy) > PHYSICS_SPEED_LIMIT ||
+        fabs(omega) > 100000.0)
+        return luaL_error(L, "draw.physicssetvelocity: invalid value");
+    body->vx = vx;
+    body->vy = vy;
+    body->omega = physics_deg_to_rad(omega);
+    return 0;
+}
+
+static int l_physicsapplyforce(lua_State *L)
+{
+    PhysicsBody *body = physics_check_body(L, 1);
+    double fx = luaL_checknumber(L, 2);
+    double fy = luaL_checknumber(L, 3);
+
+    if (!isfinite(fx) || !isfinite(fy))
+        return luaL_error(L, "draw.physicsapplyforce: invalid force");
+    body->fx += fx;
+    body->fy += fy;
+    return 0;
+}
+
+static int l_physicsapplyimpulse(lua_State *L)
+{
+    PhysicsBody *body = physics_check_body(L, 1);
+    double ix = luaL_checknumber(L, 2);
+    double iy = luaL_checknumber(L, 3);
+
+    if (!isfinite(ix) || !isfinite(iy))
+        return luaL_error(L, "draw.physicsapplyimpulse: invalid impulse");
+    body->vx += ix * body->inv_mass;
+    body->vy += iy * body->inv_mass;
+    return 0;
+}
+
+static int l_physicsfilter(lua_State *L)
+{
+    PhysicsBody *body = physics_check_body(L, 1);
+
+    body->category = physics_parse_u32_value(L, 2, body->category,
+                                             "draw.physicsfilter",
+                                             "category");
+    body->mask = physics_parse_u32_value(L, 3, body->mask,
+                                         "draw.physicsfilter", "mask");
+    lua_pushinteger(L, (lua_Integer)body->category);
+    lua_pushinteger(L, (lua_Integer)body->mask);
+    return 2;
+}
+
+static int l_physicsremove(lua_State *L)
+{
+    int id = (int)luaL_checkinteger(L, 1);
+    PhysicsBody *body = physics_body_by_id(id, "draw.physicsremove");
+    int i;
+
+    if (!body)
+        return luaL_error(L, "draw.physicsremove: body %d is not defined",
+                          id);
+    memset(body, 0, sizeof(*body));
+    for (i = 0; i < PHYSICS_JOINT_MAX; ++i) {
+        if (g_physics_joints[i].used &&
+            (g_physics_joints[i].a == id || g_physics_joints[i].b == id))
+            memset(&g_physics_joints[i], 0, sizeof(g_physics_joints[i]));
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_physicscontacts(lua_State *L)
+{
+    int i;
+
+    lua_createtable(L, g_physics_contact_count, 0);
+    for (i = 0; i < g_physics_contact_count; ++i) {
+        PhysicsContact *contact = &g_physics_contacts[i];
+
+        lua_createtable(L, 0, 7);
+        lua_pushinteger(L, contact->a);
+        lua_setfield(L, -2, "a");
+        lua_pushinteger(L, contact->b);
+        lua_setfield(L, -2, "b");
+        lua_pushnumber(L, contact->px);
+        lua_setfield(L, -2, "x");
+        lua_pushnumber(L, contact->py);
+        lua_setfield(L, -2, "y");
+        lua_pushnumber(L, contact->nx);
+        lua_setfield(L, -2, "nx");
+        lua_pushnumber(L, contact->ny);
+        lua_setfield(L, -2, "ny");
+        lua_pushboolean(L, contact->sensor);
+        lua_setfield(L, -2, "sensor");
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+static int l_physicscallback(lua_State *L)
+{
+    if (lua_isnoneornil(L, 1)) {
+        if (g_physics_callback != LUA_NOREF) {
+            luaL_unref(L, LUA_REGISTRYINDEX, g_physics_callback);
+            g_physics_callback = LUA_NOREF;
+        }
+    } else {
+        luaL_checktype(L, 1, LUA_TFUNCTION);
+        if (g_physics_callback != LUA_NOREF)
+            luaL_unref(L, LUA_REGISTRYINDEX, g_physics_callback);
+        lua_pushvalue(L, 1);
+        g_physics_callback = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    lua_pushboolean(L, g_physics_callback != LUA_NOREF);
+    return 1;
+}
+
+static int l_physicsjoint(lua_State *L)
+{
+    const char *kind = luaL_checkstring(L, 1);
+    PhysicsBody *a = physics_check_body(L, 2);
+    PhysicsBody *b = physics_check_body(L, 3);
+    PhysicsJoint tmp;
+    PhysicsJoint *joint;
+    double dist;
+    int id;
+
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.a = a->id;
+    tmp.b = b->id;
+    dist = sqrt((b->x - a->x) * (b->x - a->x) +
+                (b->y - a->y) * (b->y - a->y));
+    if (strcmp(kind, "distance") == 0)
+        tmp.kind = 0;
+    else if (strcmp(kind, "spring") == 0)
+        tmp.kind = 1;
+    else if (strcmp(kind, "pin") == 0)
+        tmp.kind = 2;
+    else
+        return luaL_error(L, "draw.physicsjoint: unknown joint type '%s'",
+                          kind);
+    tmp.rest = dist;
+    tmp.stiffness = tmp.kind == 1 ? 100.0 : 1.0;
+    tmp.damping = tmp.kind == 1 ? 2.0 : 0.0;
+    if (!lua_isnoneornil(L, 4)) {
+        int table;
+
+        if (lua_type(L, 4) != LUA_TTABLE)
+            return luaL_error(L, "draw.physicsjoint: options must be a table");
+        table = 4;
+        if (physics_read_number_field(L, table, "length", tmp.rest,
+                                      &tmp.rest, "draw.physicsjoint") ||
+            physics_read_number_field(L, table, "rest", tmp.rest,
+                                      &tmp.rest, "draw.physicsjoint") ||
+            physics_read_number_field(L, table, "stiffness", tmp.stiffness,
+                                      &tmp.stiffness, "draw.physicsjoint") ||
+            physics_read_number_field(L, table, "damping", tmp.damping,
+                                      &tmp.damping, "draw.physicsjoint") ||
+            physics_read_number_field(L, table, "ax", 0.0,
+                                      &tmp.local_a.x, "draw.physicsjoint") ||
+            physics_read_number_field(L, table, "ay", 0.0,
+                                      &tmp.local_a.y, "draw.physicsjoint") ||
+            physics_read_number_field(L, table, "bx", 0.0,
+                                      &tmp.local_b.x, "draw.physicsjoint") ||
+            physics_read_number_field(L, table, "by", 0.0,
+                                      &tmp.local_b.y, "draw.physicsjoint"))
+            return luaL_error(L, "draw.physicsjoint: invalid value");
+    }
+    if (!isfinite(tmp.rest) || tmp.rest < 0.0 ||
+        !isfinite(tmp.stiffness) || tmp.stiffness < 0.0 ||
+        !isfinite(tmp.damping) || tmp.damping < 0.0 ||
+        !isfinite(tmp.local_a.x) || !isfinite(tmp.local_a.y) ||
+        !isfinite(tmp.local_b.x) || !isfinite(tmp.local_b.y))
+        return luaL_error(L, "draw.physicsjoint: invalid joint parameters");
+    if (tmp.kind != 1 && tmp.stiffness > 1.0)
+        return luaL_error(L, "draw.physicsjoint: stiffness must be 0..1");
+    if (tmp.kind == 1 && tmp.stiffness > 10000.0)
+        return luaL_error(L, "draw.physicsjoint: stiffness is too large");
+    id = physics_alloc_joint();
+    if (id == 0)
+        return luaL_error(L, "draw.physicsjoint: too many joints (max %d)",
+                          PHYSICS_JOINT_MAX);
+    joint = &g_physics_joints[id - 1];
+    *joint = tmp;
+    joint->id = id;
+    joint->used = 1;
+    lua_pushinteger(L, id);
+    return 1;
+}
+
+static int l_physicsjointremove(lua_State *L)
+{
+    int id = (int)luaL_checkinteger(L, 1);
+    PhysicsJoint *joint = physics_joint_by_id(id, "draw.physicsjointremove");
+
+    if (!joint)
+        return luaL_error(L, "draw.physicsjointremove: joint %d is not defined",
+                          id);
+    memset(joint, 0, sizeof(*joint));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int physics_ray_segment(PhysicsVec origin, PhysicsVec dir,
+                               PhysicsVec a, PhysicsVec b,
+                               double *t, PhysicsVec *normal)
+{
+    PhysicsVec edge = physics_vec(b.x - a.x, b.y - a.y);
+    PhysicsVec q = physics_vec(a.x - origin.x, a.y - origin.y);
+    double denom = physics_cross(dir, edge);
+    double u, value;
+
+    if (fabs(denom) < 1e-12)
+        return 0;
+    value = physics_cross(q, edge) / denom;
+    u = physics_cross(q, dir) / denom;
+    if (value < 0.0 || u < 0.0 || u > 1.0)
+        return 0;
+    *normal = physics_vec(-edge.y, edge.x);
+    if (!physics_normalize(normal))
+        return 0;
+    if (physics_dot(*normal, dir) > 0.0) {
+        normal->x = -normal->x;
+        normal->y = -normal->y;
+    }
+    *t = value;
+    return 1;
+}
+
+static int physics_raycast_body(PhysicsBody *body, PhysicsVec origin,
+                                PhysicsVec dir, double length,
+                                uint32_t category, uint32_t mask,
+                                double *best_t, PhysicsVec *best_normal)
+{
+    double t = INFINITY;
+    PhysicsVec normal = physics_vec(0.0, 0.0);
+    int found = 0;
+
+    if ((body->category & mask) == 0 || (category & body->mask) == 0)
+        return 0;
+    if (body->shape == PHYSICS_CIRCLE) {
+        PhysicsVec to_center = physics_vec(origin.x - body->x,
+                                           origin.y - body->y);
+        double b = 2.0 * physics_dot(to_center, dir);
+        double c = physics_dot(to_center, to_center) -
+                   body->radius * body->radius;
+        double disc = b * b - 4.0 * c;
+        double root;
+
+        if (disc < 0.0)
+            return 0;
+        root = sqrt(disc);
+        t = (-b - root) * 0.5;
+        if (t < 0.0)
+            t = (-b + root) * 0.5;
+        if (t < 0.0 || t > length)
+            return 0;
+        normal = physics_vec(origin.x + dir.x * t - body->x,
+                             origin.y + dir.y * t - body->y);
+        if (!physics_normalize(&normal))
+            normal = physics_vec(-dir.x, -dir.y);
+        found = 1;
+    } else {
+        PhysicsVec verts[4];
+        int count;
+        int i;
+
+        physics_body_vertices(body, verts, &count);
+        for (i = 0; i < count; ++i) {
+            double value;
+            PhysicsVec candidate;
+
+            if (!physics_ray_segment(origin, dir, verts[i],
+                                     verts[(i + 1) % count], &value,
+                                     &candidate))
+                continue;
+            if (value >= 0.0 && value <= length && value < t) {
+                t = value;
+                normal = candidate;
+                found = 1;
+            }
+        }
+    }
+    if (!found || t >= *best_t)
+        return 0;
+    *best_t = t;
+    *best_normal = normal;
+    return 1;
+}
+
+static int l_physicsraycast(lua_State *L)
+{
+    double x1 = luaL_checknumber(L, 1);
+    double y1 = luaL_checknumber(L, 2);
+    double x2 = luaL_checknumber(L, 3);
+    double y2 = luaL_checknumber(L, 4);
+    uint32_t category = physics_parse_u32_value(L, 5, 0xffffffffU,
+                                                "draw.physicsraycast",
+                                                "category");
+    uint32_t mask = physics_parse_u32_value(L, 6, 0xffffffffU,
+                                            "draw.physicsraycast", "mask");
+    PhysicsVec origin = physics_vec(x1, y1);
+    PhysicsVec delta = physics_vec(x2 - x1, y2 - y1);
+    double length = physics_length(delta);
+    double best_t = INFINITY;
+    PhysicsVec best_normal = physics_vec(0.0, 0.0);
+    PhysicsBody *hit = NULL;
+    int i;
+
+    if (!isfinite(x1) || !isfinite(y1) || !isfinite(x2) || !isfinite(y2) ||
+        !physics_normalize(&delta))
+        return luaL_error(L, "draw.physicsraycast: invalid ray");
+    for (i = 0; i < PHYSICS_BODY_MAX; ++i) {
+        if (g_physics_bodies[i].used &&
+            physics_raycast_body(&g_physics_bodies[i], origin, delta, length,
+                                 category, mask, &best_t, &best_normal))
+            hit = &g_physics_bodies[i];
+    }
+    if (!hit) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushinteger(L, hit->id);
+    lua_pushnumber(L, origin.x + delta.x * best_t);
+    lua_pushnumber(L, origin.y + delta.y * best_t);
+    lua_pushnumber(L, best_normal.x);
+    lua_pushnumber(L, best_normal.y);
+    lua_pushnumber(L, best_t / length);
+    return 6;
+}
+
+static int l_physicsdraw(lua_State *L)
+{
+    int r = 255, g = 255, b = 255, a = 255;
+    int i;
+
+    if (!ensure_open(L, "draw.physicsdraw"))
+        return 0;
+    if (read_color(L, 1, &r, &g, &b, &a) < 0) {
+        r = 255;
+        g = 255;
+        b = 255;
+        a = 255;
+    }
+    lua_settop(L, 0);
+    for (i = 0; i < PHYSICS_BODY_MAX; ++i) {
+        PhysicsBody *body = &g_physics_bodies[i];
+        int br = r, bg = g, bb = b, ba = a;
+
+        if (!body->used)
+            continue;
+        if (body->has_sprite) {
+            int sprite_index = find_sprite_name(body->sprite);
+            SpriteEntry *sprite;
+
+            if (sprite_index < 0)
+                continue;
+            sprite = &g_sprites[sprite_index];
+            lua_pushinteger(L, (lua_Integer)physics_round(body->x));
+            lua_pushinteger(L, (lua_Integer)physics_round(body->y));
+            lua_pushstring(L, body->sprite);
+            lua_pushinteger(L, (lua_Integer)body->sprite_scale);
+            lua_pushinteger(L, physics_rad_to_deg(body->angle));
+            lua_pushnil(L);
+            lua_pushnil(L);
+            lua_pushnil(L);
+            lua_createtable(L, 0, 2);
+            lua_pushnumber(L, (double)sprite->width * 0.5);
+            lua_setfield(L, -2, "pivotx");
+            lua_pushnumber(L, (double)sprite->height * 0.5);
+            lua_setfield(L, -2, "pivoty");
+            l_draw_sprite(L);
+            lua_settop(L, 0);
+            continue;
+        }
+        if (body->has_color) {
+            lua_pushstring(L, body->color);
+            if (read_color(L, -1, &br, &bg, &bb, &ba) >= 0) {
+                r = br;
+                g = bg;
+                b = bb;
+                a = ba;
+            }
+            lua_pop(L, 1);
+        }
+        if (body->shape == PHYSICS_CIRCLE) {
+            fill_circle((long long)physics_round(body->x),
+                        (long long)physics_round(body->y),
+                        (long long)physics_round(body->radius),
+                        1, make_color(r, g, b, a));
+        } else if (body->shape == PHYSICS_BOX) {
+            fill_rotated_rect(body->x - body->half_w,
+                              body->y - body->half_h,
+                              body->half_w * 2.0, body->half_h * 2.0,
+                              physics_rad_to_deg(body->angle), 1,
+                              make_color(r, g, b, a));
+        } else {
+            PhysicsVec verts[4];
+            int count;
+
+            physics_body_vertices(body, verts, &count);
+            fill_triangle((long long)physics_round(verts[0].x),
+                          (long long)physics_round(verts[0].y),
+                          (long long)physics_round(verts[1].x),
+                          (long long)physics_round(verts[1].y),
+                          (long long)physics_round(verts[2].x),
+                          (long long)physics_round(verts[2].y),
+                          1, make_color(r, g, b, a));
+        }
+    }
+    return 0;
+}
+
+static int l_physicsbodycount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < PHYSICS_BODY_MAX; ++i) {
+        if (g_physics_bodies[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static int l_physicsjointcount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < PHYSICS_JOINT_MAX; ++i) {
+        if (g_physics_joints[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static CanvasEntry *canvas_by_id(lua_Integer id)
+{
+    if (id < 1 || id > CANVAS_MAX)
+        return NULL;
+    if (!g_canvases[id - 1].used)
+        return NULL;
+    return &g_canvases[id - 1];
+}
+
+static size_t canvas_total_pixels(void)
+{
+    size_t total = 0;
+    int i;
+
+    for (i = 0; i < CANVAS_MAX; ++i) {
+        if (g_canvases[i].used)
+            total += (size_t)g_canvases[i].width * (size_t)g_canvases[i].height;
+    }
+    return total;
+}
+
+static void canvas_fill(CanvasEntry *canvas, uint32_t color)
+{
+    size_t count = (size_t)canvas->width * (size_t)canvas->height;
+    size_t i;
+
+    for (i = 0; i < count; ++i)
+        canvas->pixels[i] = color;
+}
+
+static int l_canvas(lua_State *L)
+{
+    lua_Integer wi = luaL_checkinteger(L, 1);
+    lua_Integer hi = luaL_checkinteger(L, 2);
+    int w, h;
+    uint32_t color = 0;
+    CanvasEntry *canvas;
+    int i;
+    size_t total;
+    int r, g, b, a;
+
+    if (wi < 1 || hi < 1 || wi > CANVAS_DIM_MAX || hi > CANVAS_DIM_MAX)
+        return luaL_error(L, "draw.canvas: size must be 1..%d", CANVAS_DIM_MAX);
+    w = (int)wi;
+    h = (int)hi;
+    if ((long long)w * (long long)h > CANVAS_AREA_MAX)
+        return luaL_error(L, "draw.canvas: area must not exceed %d",
+                          CANVAS_AREA_MAX);
+
+    if (lua_gettop(L) >= 3 && !lua_isnoneornil(L, 3)) {
+        if (read_color(L, 3, &r, &g, &b, &a) != 0)
+            return 0;
+        color = make_color(r, g, b, a);
+    }
+
+    canvas = NULL;
+    for (i = 0; i < CANVAS_MAX; ++i) {
+        if (!g_canvases[i].used) {
+            canvas = &g_canvases[i];
+            break;
+        }
+    }
+    if (!canvas)
+        return luaL_error(L, "draw.canvas: limit of %d canvases reached",
+                          CANVAS_MAX);
+
+    total = canvas_total_pixels() + (size_t)w * (size_t)h;
+    if (total > CANVAS_TOTAL_MAX)
+        return luaL_error(L, "draw.canvas: total canvas area exceeds %d",
+                          CANVAS_TOTAL_MAX);
+
+    canvas->pixels = (uint32_t *)calloc((size_t)w * (size_t)h,
+                                        sizeof(uint32_t));
+    if (!canvas->pixels)
+        return luaL_error(L, "draw.canvas: out of memory");
+    canvas->used = 1;
+    canvas->width = w;
+    canvas->height = h;
+    if (color != 0)
+        canvas_fill(canvas, color);
+
+    lua_pushinteger(L, (lua_Integer)(canvas - g_canvases + 1));
+    return 1;
+}
+
+static int l_setcanvas(lua_State *L)
+{
+    int previous = g_canvas_target;
+    CanvasEntry *canvas;
+
+    if (lua_isnoneornil(L, 1) || lua_tointeger(L, 1) == 0) {
+        canvas_restore_main();
+        lua_pushinteger(L, previous);
+        return 1;
+    }
+
+    canvas = canvas_by_id(luaL_checkinteger(L, 1));
+    if (!canvas)
+        return luaL_error(L, "draw.setcanvas: canvas is not defined");
+
+    canvas_restore_main();
+    g_draw.pixels = canvas->pixels;
+    g_draw.width = canvas->width;
+    g_draw.height = canvas->height;
+    g_canvas_target = (int)(canvas - g_canvases + 1);
+    lua_pushinteger(L, previous);
+    return 1;
+}
+
+static int l_canvasclear(lua_State *L)
+{
+    int r = 0, g = 0, b = 0, a = 0;
+    uint32_t color = 0;
+    size_t count;
+    size_t i;
+
+    if (g_canvas_target == 0 && !ensure_open(L, "draw.canvasclear"))
+        return 0;
+    if (!g_draw.pixels)
+        return 0;
+
+    if (lua_gettop(L) >= 1 && !lua_isnoneornil(L, 1)) {
+        if (read_color(L, 1, &r, &g, &b, &a) != 0)
+            return 0;
+        color = make_color(r, g, b, a);
+    }
+
+    count = (size_t)g_draw.width * (size_t)g_draw.height;
+    for (i = 0; i < count; ++i)
+        g_draw.pixels[i] = color;
+    mark_dirty_rect(0, 0, g_draw.width, g_draw.height);
+    return 0;
+}
+
+static int l_canvassize(lua_State *L)
+{
+    CanvasEntry *canvas = canvas_by_id(luaL_checkinteger(L, 1));
+
+    if (!canvas)
+        return luaL_error(L, "draw.canvassize: canvas is not defined");
+    lua_pushinteger(L, canvas->width);
+    lua_pushinteger(L, canvas->height);
+    return 2;
+}
+
+static int l_canvasremove(lua_State *L)
+{
+    lua_Integer id = luaL_checkinteger(L, 1);
+    CanvasEntry *canvas = canvas_by_id(id);
+
+    if (!canvas) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    if (g_canvas_target == id)
+        canvas_restore_main();
+    free(canvas->pixels);
+    memset(canvas, 0, sizeof(*canvas));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_canvascount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < CANVAS_MAX; ++i) {
+        if (g_canvases[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static int l_canvasdraw(lua_State *L)
+{
+    lua_Integer id = luaL_checkinteger(L, 1);
+    CanvasEntry *canvas = canvas_by_id(id);
+    lua_Integer xi, yi;
+    int x, y;
+    int scale;
+    int angle;
+    int flipx, flipy;
+    int tr, tg, tb, ta;
+    int extra_alpha;
+    double W, H, bw, bh;
+    double xd, yd;
+    double pivot_x, pivot_y;
+    double px, py;
+    double min_x = 0.0, max_x = 0.0, min_y = 0.0, max_y = 0.0;
+    double c, s, rad;
+    double dx, dy, rot_x, rot_y, src_cx, src_cy, p, q;
+    double alpha_factor;
+    int k;
+    int sx0, sx1, sy0, sy1;
+    int sx, sy;
+    int col, row;
+
+    if (!canvas)
+        return luaL_error(L, "draw.canvasdraw: canvas is not defined");
+    if (!ensure_open(L, "draw.canvasdraw"))
+        return 0;
+    if (g_canvas_target == id)
+        return luaL_error(L, "draw.canvasdraw: cannot draw canvas into itself");
+
+    xi = luaL_checkinteger(L, 2);
+    yi = luaL_checkinteger(L, 3);
+    if (xi < -1000000 || xi > 1000000 || yi < -1000000 || yi > 1000000)
+        return luaL_error(L, "draw.canvasdraw: position out of range");
+    x = (int)xi;
+    y = (int)yi;
+    scale = parse_scale(L, 4);
+    angle = parse_angle(L, 5);
+    flipx = read_flip_field(L, 6, 1, "flip");
+    flipy = read_flip_field(L, 6, 2, "flip");
+    if (parse_tint(L, 7, &tr, &tg, &tb, &ta) != 0)
+        return 0;
+    extra_alpha = clamp_alpha_number(luaL_optnumber(L, 9, 1.0));
+    if (lua_isnoneornil(L, 8)) {
+        pivot_x = (double)canvas->width / 2.0;
+        pivot_y = (double)canvas->height / 2.0;
+    } else {
+        if (lua_type(L, 8) != LUA_TTABLE)
+            return luaL_error(L, "draw.canvasdraw: pivot must be a table");
+        pivot_x = read_pivot_field(L, 8, 1,
+                                   (double)canvas->width / 2.0);
+        pivot_y = read_pivot_field(L, 8, 2,
+                                   (double)canvas->height / 2.0);
+    }
+    if (!isfinite(pivot_x) || !isfinite(pivot_y) || pivot_x < -1000000.0 ||
+        pivot_x > 1000000.0 || pivot_y < -1000000.0 ||
+        pivot_y > 1000000.0)
+        return luaL_error(L,
+            "draw.canvasdraw: pivot must be finite and within +/-1000000");
+    if (flipx)
+        pivot_x = (double)canvas->width - pivot_x;
+    if (flipy)
+        pivot_y = (double)canvas->height - pivot_y;
+    px = pivot_x * (double)scale;
+    py = pivot_y * (double)scale;
+
+    W = (double)canvas->width * (double)scale;
+    H = (double)canvas->height * (double)scale;
+    rad = (double)angle * 0.017453292519943295769236907684886;
+    c = cos(rad);
+    s = sin(rad);
+    if (fabs(c) < 1e-12)
+        c = 0.0;
+    if (fabs(s) < 1e-12)
+        s = 0.0;
+
+    for (k = 0; k < 4; ++k) {
+        double vx = (k & 1) ? W - px : -px;
+        double vy = (k & 2) ? H - py : -py;
+        double rx = vx * c - vy * s;
+        double ry = vx * s + vy * c;
+
+        if (k == 0) {
+            min_x = max_x = rx;
+            min_y = max_y = ry;
+        } else {
+            if (rx < min_x) min_x = rx;
+            if (rx > max_x) max_x = rx;
+            if (ry < min_y) min_y = ry;
+            if (ry > max_y) max_y = ry;
+        }
+    }
+    bw = max_x - min_x;
+    bh = max_y - min_y;
+    xd = (double)x;
+    yd = (double)y;
+
+    if (!lua_isnoneornil(L, 8)) {
+        if (!visible_range(xd + min_x, bw, g_draw.width, &sx0, &sx1) ||
+            !visible_range(yd + min_y, bh, g_draw.height, &sy0, &sy1))
+            return 0;
+    } else {
+        if (!visible_range(xd, bw, g_draw.width, &sx0, &sx1) ||
+            !visible_range(yd, bh, g_draw.height, &sy0, &sy1))
+            return 0;
+    }
+
+    alpha_factor = (double)extra_alpha * (double)g_draw.alpha / 65025.0;
+
+    for (sy = sy0; sy <= sy1; ++sy) {
+        dy = (double)sy + 0.5 - yd;
+        if (lua_isnoneornil(L, 8))
+            dy += min_y;
+
+        for (sx = sx0; sx <= sx1; ++sx) {
+            dx = (double)sx + 0.5 - xd;
+            if (lua_isnoneornil(L, 8))
+                dx += min_x;
+            rot_x = dx;
+            rot_y = dy;
+            src_cx = rot_x * c + rot_y * s;
+            src_cy = -rot_x * s + rot_y * c;
+            p = src_cx + px;
+            q = src_cy + py;
+
+            if (p < 0.0 || p >= W || q < 0.0 || q >= H)
+                continue;
+
+            col = (int)floor(p / scale + 1e-9);
+            row = (int)floor(q / scale + 1e-9);
+            if (flipx)
+                col = canvas->width - 1 - col;
+            if (flipy)
+                row = canvas->height - 1 - row;
+            if (col < 0 || col >= canvas->width ||
+                row < 0 || row >= canvas->height)
+                continue;
+
+            {
+                uint32_t src = canvas->pixels[(size_t)row * canvas->width +
+                                              (size_t)col];
+                int sa = (int)((src >> 24) & 0xFF);
+                int sr = (int)((src >> 16) & 0xFF);
+                int sg = (int)((src >> 8) & 0xFF);
+                int sb = (int)(src & 0xFF);
+                uint32_t color;
+
+                sa = (int)(sa * ta / 255.0 * alpha_factor + 0.5);
+                sr = sr * tr / 255;
+                sg = sg * tg / 255;
+                sb = sb * tb / 255;
+                color = ((uint32_t)sa << 24) |
+                        ((uint32_t)sr << 16) |
+                        ((uint32_t)sg << 8) |
+                        (uint32_t)sb;
+                g_draw.pixels[(size_t)sy * g_draw.width + sx] =
+                    blend_color(
+                        g_draw.pixels[(size_t)sy * g_draw.width + sx],
+                        color);
+            }
+        }
+    }
+
+    mark_dirty_rect(sx0, sy0, sx1 - sx0 + 1, sy1 - sy0 + 1);
+    return 0;
+}
+
+static int find_tilemap_name(const char *name)
+{
+    int i;
+
+    for (i = 0; i < TILEMAP_MAX; ++i) {
+        if (g_tilemaps[i].used && strcmp(g_tilemaps[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int tile_from_char(char ch, int *out)
+{
+    int value;
+
+    if (ch == '.' || ch == ' ') {
+        *out = -1;
+        return 0;
+    }
+    if (ch >= '0' && ch <= '9')
+        value = ch - '0';
+    else if (ch >= 'a' && ch <= 'z')
+        value = 10 + (ch - 'a');
+    else if (ch >= 'A' && ch <= 'Z')
+        value = 36 + (ch - 'A');
+    else
+        return -1;
+    if (value >= TILEMAP_TILE_MAX)
+        return -1;
+    *out = value;
+    return 0;
+}
+
+static void tilemap_remove_bodies(TilemapEntry *map)
+{
+    int i;
+
+    for (i = 0; i < map->body_count; ++i) {
+        int id = map->body_ids[i];
+
+        if (id > 0 && id <= PHYSICS_BODY_MAX)
+            memset(&g_physics_bodies[id - 1], 0, sizeof(PhysicsBody));
+    }
+    map->body_count = 0;
+    memset(map->body_ids, 0, sizeof(map->body_ids));
+}
+
+static int l_tilemap(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    size_t name_len = strlen(name);
+    lua_Integer size_value = luaL_checkinteger(L, 4);
+    TilemapEntry *map;
+    signed char cells[TILEMAP_ROW_MAX * TILEMAP_COL_MAX];
+    int used_tiles[TILEMAP_TILE_MAX];
+    int solid_set[TILEMAP_TILE_MAX];
+    int solid_all = 0;
+    int rows;
+    int cols = 0;
+    int size;
+    int i, j;
+    int free_index = -1;
+    int value;
+
+    if (name_len == 0 || name_len >= sizeof(map->name))
+        return luaL_error(L, "draw.tilemap: invalid name");
+    if (lua_type(L, 2) != LUA_TTABLE)
+        return luaL_error(L, "draw.tilemap: rows must be a table");
+    if (lua_type(L, 3) != LUA_TTABLE)
+        return luaL_error(L, "draw.tilemap: tiles must be a table");
+    if (size_value < 1 || size_value > CANVAS_DIM_MAX)
+        return luaL_error(L, "draw.tilemap: tile size must be 1..%d",
+                          CANVAS_DIM_MAX);
+    size = (int)size_value;
+
+    if (find_tilemap_name(name) >= 0)
+        return luaL_error(L, "draw.tilemap: '%s' is already defined", name);
+    for (i = 0; i < TILEMAP_MAX; ++i) {
+        if (!g_tilemaps[i].used) {
+            free_index = i;
+            break;
+        }
+    }
+    if (free_index < 0)
+        return luaL_error(L, "draw.tilemap: limit of %d maps reached",
+                          TILEMAP_MAX);
+
+    rows = (int)lua_rawlen(L, 2);
+    if (rows < 1 || rows > TILEMAP_ROW_MAX)
+        return luaL_error(L, "draw.tilemap: rows must be 1..%d",
+                          TILEMAP_ROW_MAX);
+    memset(cells, -1, sizeof(cells));
+    memset(used_tiles, 0, sizeof(used_tiles));
+    memset(solid_set, 0, sizeof(solid_set));
+
+    for (i = 0; i < rows; ++i) {
+        lua_rawgeti(L, 2, i + 1);
+        if (lua_type(L, -1) == LUA_TSTRING) {
+            const char *text = lua_tostring(L, -1);
+            size_t len = strlen(text);
+
+            if (len > TILEMAP_COL_MAX) {
+                lua_pop(L, 1);
+                return luaL_error(L, "draw.tilemap: row %d is too long", i + 1);
+            }
+            for (j = 0; j < (int)len; ++j) {
+                if (tile_from_char(text[j], &value) != 0) {
+                    lua_pop(L, 1);
+                    return luaL_error(L,
+                        "draw.tilemap: invalid tile character in row %d",
+                        i + 1);
+                }
+                if (value >= 0) {
+                    cells[i * TILEMAP_COL_MAX + j] = (signed char)value;
+                    used_tiles[value] = 1;
+                }
+            }
+            if ((int)len > cols)
+                cols = (int)len;
+        } else if (lua_type(L, -1) == LUA_TTABLE) {
+            size_t len = lua_rawlen(L, -1);
+
+            if (len > TILEMAP_COL_MAX) {
+                lua_pop(L, 1);
+                return luaL_error(L, "draw.tilemap: row %d is too long", i + 1);
+            }
+            for (j = 0; j < (int)len; ++j) {
+                lua_rawgeti(L, -1, j + 1);
+                if (lua_isnil(L, -1)) {
+                    value = -1;
+                } else if (lua_isnumber(L, -1)) {
+                    lua_Integer v = lua_tointeger(L, -1);
+
+                    if (v < -1 || v >= TILEMAP_TILE_MAX) {
+                        lua_pop(L, 2);
+                        return luaL_error(L,
+                            "draw.tilemap: tile index out of range in row %d",
+                            i + 1);
+                    }
+                    value = (int)v;
+                } else {
+                    lua_pop(L, 2);
+                    return luaL_error(L,
+                        "draw.tilemap: tile must be a number in row %d",
+                        i + 1);
+                }
+                lua_pop(L, 1);
+                if (value >= 0) {
+                    cells[i * TILEMAP_COL_MAX + j] = (signed char)value;
+                    used_tiles[value] = 1;
+                }
+            }
+            if ((int)len > cols)
+                cols = (int)len;
+        } else {
+            lua_pop(L, 1);
+            return luaL_error(L, "draw.tilemap: row %d must be a string or table",
+                              i + 1);
+        }
+        lua_pop(L, 1);
+    }
+
+    if (cols < 1)
+        return luaL_error(L, "draw.tilemap: map is empty");
+
+    if (!lua_isnoneornil(L, 5)) {
+        if (lua_type(L, 5) == LUA_TBOOLEAN) {
+            solid_all = lua_toboolean(L, 5) ? 1 : 0;
+        } else if (lua_type(L, 5) == LUA_TTABLE) {
+            size_t count = lua_rawlen(L, 5);
+
+            for (i = 1; i <= (int)count; ++i) {
+                lua_rawgeti(L, 5, i);
+                if (!lua_isnumber(L, -1)) {
+                    lua_pop(L, 1);
+                    return luaL_error(L,
+                        "draw.tilemap: solid entries must be tile indices");
+                }
+                value = (int)lua_tointeger(L, -1);
+                lua_pop(L, 1);
+                if (value < 0 || value >= TILEMAP_TILE_MAX)
+                    return luaL_error(L,
+                        "draw.tilemap: solid tile index out of range");
+                solid_set[value] = 1;
+            }
+        } else {
+            return luaL_error(L,
+                "draw.tilemap: solid must be a boolean or table");
+        }
+    }
+
+    map = &g_tilemaps[free_index];
+    memset(map, 0, sizeof(*map));
+    map->used = 1;
+    strcpy(map->name, name);
+    map->rows = rows;
+    map->cols = cols;
+    map->size = size;
+    memcpy(map->cells, cells, sizeof(cells));
+
+    for (i = 0; i < TILEMAP_TILE_MAX; ++i) {
+        const char *sprite_name;
+
+        if (!used_tiles[i])
+            continue;
+        lua_rawgeti(L, 3, i + 1);
+        sprite_name = lua_tostring(L, -1);
+        if (!sprite_name || find_sprite_name(sprite_name) < 0) {
+            lua_pop(L, 1);
+            tilemap_remove_bodies(map);
+            memset(map, 0, sizeof(*map));
+            return luaL_error(L,
+                "draw.tilemap: sprite for tile %d is not defined", i);
+        }
+        strcpy(map->tiles[i], sprite_name);
+        lua_pop(L, 1);
+    }
+
+    for (i = 0; i < rows; ++i) {
+        for (j = 0; j < cols; ++j) {
+            PhysicsBody tmp;
+            PhysicsBody *body;
+            int id;
+            int tile = map->cells[i * TILEMAP_COL_MAX + j];
+
+            if (tile < 0 || !(solid_all || solid_set[tile]))
+                continue;
+            if (map->body_count >= TILEMAP_BODY_MAX) {
+                tilemap_remove_bodies(map);
+                memset(map, 0, sizeof(*map));
+                return luaL_error(L,
+                    "draw.tilemap: too many solid tiles (max %d)",
+                    TILEMAP_BODY_MAX);
+            }
+            memset(&tmp, 0, sizeof(tmp));
+            tmp.type = PHYSICS_STATIC;
+            tmp.shape = PHYSICS_BOX;
+            tmp.x = ((double)j + 0.5) * (double)size;
+            tmp.y = ((double)i + 0.5) * (double)size;
+            tmp.half_w = (double)size * 0.5;
+            tmp.half_h = (double)size * 0.5;
+            tmp.mass = 1.0;
+            tmp.restitution = 0.0;
+            tmp.friction = 0.5;
+            tmp.category = 0xffffffffU;
+            tmp.mask = 0xffffffffU;
+            id = physics_alloc_body();
+            if (id == 0) {
+                tilemap_remove_bodies(map);
+                memset(map, 0, sizeof(*map));
+                return luaL_error(L,
+                    "draw.tilemap: too many physics bodies (max %d)",
+                    PHYSICS_BODY_MAX);
+            }
+            body = &g_physics_bodies[id - 1];
+            *body = tmp;
+            body->id = id;
+            body->used = 1;
+            map->body_ids[map->body_count++] = id;
+        }
+    }
+
+    lua_pushinteger(L, free_index + 1);
+    return 1;
+}
+
+static int l_drawtilemap(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    int index = find_tilemap_name(name);
+    TilemapEntry *map;
+    double camx, camy;
+    int col0, col1, row0, row1;
+    int row, col;
+    double size;
+
+    if (index < 0)
+        return luaL_error(L, "draw.drawtilemap: '%s' is not defined", name);
+    if (!ensure_open(L, "draw.drawtilemap"))
+        return 0;
+    map = &g_tilemaps[index];
+    camx = luaL_optnumber(L, 2, g_camera_x);
+    camy = luaL_optnumber(L, 3, g_camera_y);
+    if (!isfinite(camx) || !isfinite(camy) || fabs(camx) > 1000000000.0 ||
+        fabs(camy) > 1000000000.0)
+        return luaL_error(L, "draw.drawtilemap: camera is invalid");
+    size = (double)map->size;
+
+    col0 = (int)floor(camx / size);
+    row0 = (int)floor(camy / size);
+    col1 = (int)floor((camx + (double)g_draw.width - 1.0) / size);
+    row1 = (int)floor((camy + (double)g_draw.height - 1.0) / size);
+    if (col0 < 0) col0 = 0;
+    if (row0 < 0) row0 = 0;
+    if (col1 >= map->cols) col1 = map->cols - 1;
+    if (row1 >= map->rows) row1 = map->rows - 1;
+    if (col0 > col1 || row0 > row1)
+        return 0;
+
+    for (row = row0; row <= row1; ++row) {
+        for (col = col0; col <= col1; ++col) {
+            int tile = map->cells[row * TILEMAP_COL_MAX + col];
+            SpriteEntry *sprite;
+            double left, top;
+            int sx0, sx1, sy0, sy1;
+            int sx, sy;
+
+            if (tile < 0)
+                continue;
+            sprite = &g_sprites[find_sprite_name(map->tiles[tile])];
+            left = (double)col * size - camx;
+            top = (double)row * size - camy;
+            sx0 = (int)floor(left);
+            sy0 = (int)floor(top);
+            sx1 = (int)ceil(left + size) - 1;
+            sy1 = (int)ceil(top + size) - 1;
+            if (sx0 < 0) sx0 = 0;
+            if (sy0 < 0) sy0 = 0;
+            if (sx1 >= g_draw.width) sx1 = g_draw.width - 1;
+            if (sy1 >= g_draw.height) sy1 = g_draw.height - 1;
+            if (sx0 > sx1 || sy0 > sy1)
+                continue;
+
+            for (sy = sy0; sy <= sy1; ++sy) {
+                int src_y = (int)(((double)sy - top) * sprite->height / size);
+
+                if (src_y < 0) src_y = 0;
+                if (src_y >= sprite->height) src_y = sprite->height - 1;
+
+                for (sx = sx0; sx <= sx1; ++sx) {
+                    int src_x = (int)(((double)sx - left) * sprite->width /
+                                      size);
+                    int value;
+
+                    if (src_x < 0) src_x = 0;
+                    if (src_x >= sprite->width) src_x = sprite->width - 1;
+                    value = sprite->pixels[(size_t)src_y * sprite->width +
+                                           (size_t)src_x];
+                    if (value < 0 || value >= g_palette_count ||
+                        !g_palette[value].used)
+                        continue;
+                    {
+                        uint32_t color = make_color(g_palette[value].r,
+                                                    g_palette[value].g,
+                                                    g_palette[value].b,
+                                                    g_palette[value].a);
+                        size_t dst = (size_t)sy * g_draw.width + (size_t)sx;
+
+                        g_draw.pixels[dst] =
+                            blend_color(g_draw.pixels[dst], color);
+                    }
+                }
+            }
+        }
+    }
+
+    mark_dirty_rect((int)floor(-camx), (int)floor(-camy),
+                    map->cols * map->size, map->rows * map->size);
+    return 0;
+}
+
+static int l_camera(lua_State *L)
+{
+    if (lua_gettop(L) == 0) {
+        lua_pushnumber(L, g_camera_x);
+        lua_pushnumber(L, g_camera_y);
+        return 2;
+    }
+
+    {
+        double x = luaL_optnumber(L, 1, g_camera_x);
+        double y = luaL_optnumber(L, 2, g_camera_y);
+
+        if (!isfinite(x) || !isfinite(y) || fabs(x) > 1000000000.0 ||
+            fabs(y) > 1000000000.0)
+            return luaL_error(L, "draw.camera: invalid position");
+        g_camera_x = x;
+        g_camera_y = y;
+    }
+    lua_pushnumber(L, g_camera_x);
+    lua_pushnumber(L, g_camera_y);
+    return 2;
+}
+
+static int l_screentoworld(lua_State *L)
+{
+    double x = luaL_checknumber(L, 1);
+    double y = luaL_checknumber(L, 2);
+
+    if (!isfinite(x) || !isfinite(y))
+        return luaL_error(L, "draw.screentoworld: invalid position");
+    lua_pushnumber(L, x + g_camera_x);
+    lua_pushnumber(L, y + g_camera_y);
+    return 2;
+}
+
+static int l_tilemapremove(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    int index = find_tilemap_name(name);
+
+    if (index < 0) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    tilemap_remove_bodies(&g_tilemaps[index]);
+    memset(&g_tilemaps[index], 0, sizeof(g_tilemaps[index]));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_tilemapcount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < TILEMAP_MAX; ++i) {
+        if (g_tilemaps[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static int ttf_find_font(lua_State *L, int index)
+{
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        lua_Integer id = luaL_checkinteger(L, index);
+
+        if (id < 1 || id > TTF_FONT_MAX || !g_ttf_fonts[id - 1].used) {
+            luaL_error(L, "draw.ttf: font is not defined");
+            return -1;
+        }
+        return (int)id - 1;
+    }
+    if (lua_type(L, index) == LUA_TSTRING) {
+        const char *name = lua_tostring(L, index);
+        int i;
+
+        for (i = 0; i < TTF_FONT_MAX; ++i) {
+            if (g_ttf_fonts[i].used && strcmp(g_ttf_fonts[i].name, name) == 0)
+                return i;
+        }
+    }
+    luaL_error(L, "draw.ttf: font is not defined");
+    return -1;
+}
+
+static void ttf_cache_free(TtfCacheEntry *entry)
+{
+    if (entry->surface)
+        SDL_FreeSurface(entry->surface);
+    free(entry->text);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static void ttf_cache_clear_font(int font_id)
+{
+    int i;
+
+    for (i = 0; i < TTF_CACHE_MAX; ++i) {
+        if (g_ttf_cache[i].used && g_ttf_cache[i].font_id == font_id)
+            ttf_cache_free(&g_ttf_cache[i]);
+    }
+}
+
+static SDL_Surface *ttf_render_text(lua_State *L, int font_id, const char *text)
+{
+    TtfEntry *font = &g_ttf_fonts[font_id];
+    TtfCacheEntry *entry = NULL;
+    TtfCacheEntry *victim = NULL;
+    SDL_Color white = {255, 255, 255, 255};
+    SDL_Surface *rendered;
+    SDL_Surface *converted;
+    size_t len;
+    int i;
+
+    for (i = 0; i < TTF_CACHE_MAX; ++i) {
+        if (g_ttf_cache[i].used && g_ttf_cache[i].font_id == font_id &&
+            strcmp(g_ttf_cache[i].text, text) == 0) {
+            entry = &g_ttf_cache[i];
+            break;
+        }
+    }
+    if (entry) {
+        entry->stamp = ++g_ttf_stamp;
+        return entry->surface;
+    }
+
+    rendered = TTF_RenderUTF8_Blended(font->font, text, white);
+    if (!rendered) {
+        luaL_error(L, "draw.ttf: cannot render text: %s", TTF_GetError());
+        return NULL;
+    }
+    converted = SDL_ConvertSurfaceFormat(rendered, SDL_PIXELFORMAT_ARGB8888, 0);
+    SDL_FreeSurface(rendered);
+    if (!converted) {
+        luaL_error(L, "draw.ttf: cannot convert text: %s", SDL_GetError());
+        return NULL;
+    }
+
+    len = strlen(text) + 1;
+    for (i = 0; i < TTF_CACHE_MAX; ++i) {
+        if (!g_ttf_cache[i].used) {
+            entry = &g_ttf_cache[i];
+            break;
+        }
+        if (!victim || g_ttf_cache[i].stamp < victim->stamp)
+            victim = &g_ttf_cache[i];
+    }
+    if (!entry)
+        entry = victim;
+    ttf_cache_free(entry);
+    entry->text = (char *)malloc(len);
+    if (!entry->text) {
+        SDL_FreeSurface(converted);
+        luaL_error(L, "draw.ttf: out of memory");
+        return NULL;
+    }
+    memcpy(entry->text, text, len);
+    entry->surface = converted;
+    entry->font_id = font_id;
+    entry->stamp = ++g_ttf_stamp;
+    entry->used = 1;
+    return converted;
+}
+
+static void ttf_blit(SDL_Surface *surface, int x, int y,
+                     int r, int g, int b, int a)
+{
+    int width = surface->w;
+    int height = surface->h;
+    int sx, sy;
+
+    for (sy = 0; sy < height; ++sy) {
+        uint32_t *row = (uint32_t *)((uint8_t *)surface->pixels +
+                                     (size_t)sy * surface->pitch);
+
+        for (sx = 0; sx < width; ++sx) {
+            uint32_t src = row[sx];
+            int sa = (int)((src >> 24) & 0xFF);
+            int sr, sg, sb;
+            uint32_t color;
+            int dx = x + sx;
+            int dy = y + sy;
+            size_t dst;
+
+            if (dx < 0 || dy < 0 || dx >= g_draw.width || dy >= g_draw.height)
+                continue;
+            sa = sa * a * g_draw.alpha / 65025;
+            if (sa <= 0)
+                continue;
+            sr = (int)(((src >> 16) & 0xFF) * r / 255);
+            sg = (int)(((src >> 8) & 0xFF) * g / 255);
+            sb = (int)((src & 0xFF) * b / 255);
+            color = ((uint32_t)sa << 24) |
+                    ((uint32_t)sr << 16) |
+                    ((uint32_t)sg << 8) |
+                    (uint32_t)sb;
+            dst = (size_t)dy * g_draw.width + (size_t)dx;
+            g_draw.pixels[dst] = blend_color(g_draw.pixels[dst], color);
+        }
+    }
+    mark_dirty_rect(x, y, width, height);
+}
+
+static int ttf_parse_style(lua_State *L, int index)
+{
+    int style = TTF_STYLE_NORMAL;
+
+    if (lua_isnoneornil(L, index))
+        return style;
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        lua_Integer value = luaL_checkinteger(L, index);
+
+        if (value < 0 || value > 0xFFFF)
+            return luaL_error(L, "draw.ttf: style is out of range");
+        return (int)value;
+    }
+    if (lua_type(L, index) == LUA_TSTRING) {
+        const char *name = lua_tostring(L, index);
+
+        if (strcmp(name, "normal") == 0)
+            return TTF_STYLE_NORMAL;
+        if (strcmp(name, "bold") == 0)
+            return TTF_STYLE_BOLD;
+        if (strcmp(name, "italic") == 0)
+            return TTF_STYLE_ITALIC;
+        if (strcmp(name, "underline") == 0)
+            return TTF_STYLE_UNDERLINE;
+        if (strcmp(name, "strikethrough") == 0)
+            return TTF_STYLE_STRIKETHROUGH;
+    }
+    return luaL_error(L,
+        "draw.ttf: style must be normal, bold, italic, underline, or "
+        "strikethrough");
+}
+
+static int l_ttf(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    const char *path = luaL_checkstring(L, 2);
+    lua_Integer ptsize = luaL_checkinteger(L, 3);
+    int style;
+    lua_Integer outline;
+    size_t name_len = strlen(name);
+    TtfEntry *font = NULL;
+    TTF_Font *loaded;
+    int i;
+
+    if (name_len == 0 || name_len >= sizeof(font->name))
+        return luaL_error(L, "draw.ttf: invalid name");
+    if (ptsize < 1 || ptsize > 256)
+        return luaL_error(L, "draw.ttf: ptsize must be 1..256");
+    style = ttf_parse_style(L, 4);
+    if (lua_isnoneornil(L, 4))
+        style = TTF_STYLE_NORMAL;
+    outline = luaL_optinteger(L, 5, 0);
+    if (outline < 0 || outline > 8)
+        return luaL_error(L, "draw.ttf: outline must be 0..8");
+    if (TTF_Init() != 0)
+        return luaL_error(L, "draw.ttf: TTF_Init failed: %s", TTF_GetError());
+
+    for (i = 0; i < TTF_FONT_MAX; ++i) {
+        if (g_ttf_fonts[i].used && strcmp(g_ttf_fonts[i].name, name) == 0)
+            return luaL_error(L, "draw.ttf: '%s' is already defined", name);
+        if (!g_ttf_fonts[i].used && !font)
+            font = &g_ttf_fonts[i];
+    }
+    if (!font)
+        return luaL_error(L, "draw.ttf: limit of %d fonts reached",
+                          TTF_FONT_MAX);
+
+    loaded = TTF_OpenFont(path, (int)ptsize);
+    if (!loaded)
+        return luaL_error(L, "draw.ttf: cannot open '%s': %s", path,
+                          TTF_GetError());
+    TTF_SetFontStyle(loaded, style);
+    TTF_SetFontOutline(loaded, (int)outline);
+    memset(font, 0, sizeof(*font));
+    font->used = 1;
+    strcpy(font->name, name);
+    font->font = loaded;
+    font->ptsize = (int)ptsize;
+    lua_pushinteger(L, (lua_Integer)(font - g_ttf_fonts + 1));
+    return 1;
+}
+
+static int l_ttftext(lua_State *L)
+{
+    lua_Integer xi = luaL_checkinteger(L, 1);
+    lua_Integer yi = luaL_checkinteger(L, 2);
+    const char *text = luaL_checkstring(L, 4);
+    int font_id;
+    SDL_Surface *surface;
+    int r = 255, g = 255, b = 255, a = 255;
+    int extra_alpha;
+
+    if (!ensure_open(L, "draw.ttftext"))
+        return 0;
+    if (xi < -1000000 || xi > 1000000 || yi < -1000000 || yi > 1000000)
+        return luaL_error(L, "draw.ttftext: position out of range");
+    if (strlen(text) > 8192)
+        return luaL_error(L, "draw.ttftext: text is too long");
+    font_id = ttf_find_font(L, 3);
+    extra_alpha = clamp_alpha_number(luaL_optnumber(L, 6, 1.0));
+    if (lua_gettop(L) >= 5 && !lua_isnoneornil(L, 5)) {
+        if (read_color(L, 5, &r, &g, &b, &a) != 0)
+            return 0;
+    }
+    a = a * extra_alpha / 255;
+    surface = ttf_render_text(L, font_id, text);
+    ttf_blit(surface, (int)xi, (int)yi, r, g, b, a);
+    return 0;
+}
+
+static int l_ttfsize(lua_State *L)
+{
+    int font_id = ttf_find_font(L, 1);
+    const char *text = luaL_checkstring(L, 2);
+    SDL_Surface *surface;
+
+    if (strlen(text) > 8192)
+        return luaL_error(L, "draw.ttfsize: text is too long");
+    surface = ttf_render_text(L, font_id, text);
+    lua_pushinteger(L, surface->w);
+    lua_pushinteger(L, surface->h);
+    return 2;
+}
+
+static int l_ttfremove(lua_State *L)
+{
+    int font_id = ttf_find_font(L, 1);
+
+    ttf_cache_clear_font(font_id);
+    TTF_CloseFont(g_ttf_fonts[font_id].font);
+    memset(&g_ttf_fonts[font_id], 0, sizeof(g_ttf_fonts[font_id]));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_ttfcount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < TTF_FONT_MAX; ++i) {
+        if (g_ttf_fonts[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static int mixer_init(lua_State *L)
+{
+    int flags = MIX_INIT_OGG | MIX_INIT_MP3 | MIX_INIT_MOD | MIX_INIT_FLAC;
+    int spec_count;
+
+    if (g_mixer_ready)
+        return 0;
+    Mix_Init(flags);
+    spec_count = Mix_QuerySpec(NULL, NULL, NULL);
+    if (spec_count == 0 && Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2,
+                                         2048) != 0) {
+        luaL_error(L, "draw.mixer: cannot open audio: %s", Mix_GetError());
+        return -1;
+    }
+    g_mixer_ready = 1;
+    for (int i = 0; i < MIXER_CHANNEL_MAX; ++i) {
+        g_channel_left[i] = 127;
+        g_channel_right[i] = 127;
+    }
+    Mix_Volume(-1, MIX_MAX_VOLUME);
+    Mix_VolumeMusic(MIX_MAX_VOLUME);
+    return 0;
+}
+
+static MixerEntry *mixer_find(lua_State *L, int index, int kind)
+{
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        lua_Integer id = luaL_checkinteger(L, index);
+
+        if (id < 1 || id > MIXER_ASSET_MAX || !g_mixer_assets[id - 1].used ||
+            g_mixer_assets[id - 1].kind != kind) {
+            luaL_error(L, "draw.mixer: asset is not defined");
+            return NULL;
+        }
+        return &g_mixer_assets[id - 1];
+    }
+    if (lua_type(L, index) == LUA_TSTRING) {
+        const char *name = lua_tostring(L, index);
+        int i;
+
+        for (i = 0; i < MIXER_ASSET_MAX; ++i) {
+            if (g_mixer_assets[i].used && g_mixer_assets[i].kind == kind &&
+                strcmp(g_mixer_assets[i].name, name) == 0)
+                return &g_mixer_assets[i];
+        }
+    }
+    luaL_error(L, "draw.mixer: asset is not defined");
+    return NULL;
+}
+
+static int mixer_volume(lua_State *L, int index, int fallback)
+{
+    if (lua_isnoneornil(L, index))
+        return fallback;
+    return clamp_alpha_number(luaL_optnumber(L, index, 1.0));
+}
+
+static MixerEntry *mixer_alloc(lua_State *L, int kind, const char *name)
+{
+    MixerEntry *entry = NULL;
+    int i;
+
+    for (i = 0; i < MIXER_ASSET_MAX; ++i) {
+        if (g_mixer_assets[i].used &&
+            strcmp(g_mixer_assets[i].name, name) == 0) {
+            luaL_error(L, "draw.mixer: '%s' is already defined", name);
+            return NULL;
+        }
+        if (!g_mixer_assets[i].used && !entry)
+            entry = &g_mixer_assets[i];
+    }
+    if (!entry) {
+        luaL_error(L, "draw.mixer: limit of %d assets reached",
+                   MIXER_ASSET_MAX);
+        return NULL;
+    }
+    memset(entry, 0, sizeof(*entry));
+    entry->used = 1;
+    entry->kind = kind;
+    strcpy(entry->name, name);
+    return entry;
+}
+
+static int l_sample(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    const char *path = luaL_checkstring(L, 2);
+    MixerEntry *entry;
+    Mix_Chunk *chunk;
+
+    if (strlen(name) == 0 || strlen(name) >= sizeof(entry->name))
+        return luaL_error(L, "draw.sample: invalid name");
+    if (mixer_init(L) != 0)
+        return 0;
+    entry = mixer_alloc(L, 1, name);
+    if (!entry)
+        return 0;
+    chunk = Mix_LoadWAV(path);
+    if (!chunk) {
+        memset(entry, 0, sizeof(*entry));
+        return luaL_error(L, "draw.sample: cannot open '%s': %s", path,
+                          Mix_GetError());
+    }
+    entry->chunk = chunk;
+    lua_pushinteger(L, (lua_Integer)(entry - g_mixer_assets + 1));
+    return 1;
+}
+
+static int l_music(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    const char *path = luaL_checkstring(L, 2);
+    MixerEntry *entry;
+    Mix_Music *music;
+
+    if (strlen(name) == 0 || strlen(name) >= sizeof(entry->name))
+        return luaL_error(L, "draw.music: invalid name");
+    if (mixer_init(L) != 0)
+        return 0;
+    entry = mixer_alloc(L, 2, name);
+    if (!entry)
+        return 0;
+    music = Mix_LoadMUS(path);
+    if (!music) {
+        memset(entry, 0, sizeof(*entry));
+        return luaL_error(L, "draw.music: cannot open '%s': %s", path,
+                          Mix_GetError());
+    }
+    entry->music = music;
+    lua_pushinteger(L, (lua_Integer)(entry - g_mixer_assets + 1));
+    return 1;
+}
+
+static int l_playsample(lua_State *L)
+{
+    MixerEntry *entry = mixer_find(L, 1, 1);
+    int volume = mixer_volume(L, 2, 255);
+    lua_Integer loops = luaL_optinteger(L, 3, 0);
+    int channel;
+    double pan;
+    int has_x = !lua_isnoneornil(L, 4);
+    int has_y = !lua_isnoneornil(L, 5);
+    int has_pan = !lua_isnoneornil(L, 6);
+
+    if (!entry)
+        return 0;
+    if (loops < -1 || loops > 1000000)
+        return luaL_error(L, "draw.playsample: loops must be -1 or non-negative");
+    if (has_x || has_y) {
+        double x = luaL_optnumber(L, 4, g_listener_x);
+        double y = luaL_optnumber(L, 5, g_listener_y);
+        double dx = x - g_listener_x;
+        double dy = y - g_listener_y;
+        double dist = sqrt(dx * dx + dy * dy);
+
+        if (!isfinite(x) || !isfinite(y))
+            return luaL_error(L, "draw.playsample: invalid position");
+        volume = (int)(volume *
+                       fmax(0.0, 1.0 - dist / g_listener_spread) + 0.5);
+        if (!has_pan && g_listener_spread > 0.0)
+            pan = fmax(-1.0, fmin(1.0, dx / g_listener_spread));
+        else
+            pan = 0.0;
+    } else {
+        pan = has_pan ? luaL_checknumber(L, 6) : 0.0;
+    }
+    if (!isfinite(pan) || pan < -1.0 || pan > 1.0)
+        return luaL_error(L, "draw.playsample: pan must be -1..1");
+
+    channel = Mix_PlayChannelTimed(-1, entry->chunk, (int)loops, -1);
+    if (channel < 0)
+        return luaL_error(L, "draw.playsample: no free channel: %s",
+                          Mix_GetError());
+    Mix_Volume(channel, volume);
+    if (has_pan || has_x || has_y) {
+        int left = (int)(255.0 * (1.0 - pan) * 0.5 + 0.5);
+        int right = (int)(255.0 * (1.0 + pan) * 0.5 + 0.5);
+
+        Mix_SetPanning(channel, left, right);
+        if (channel < MIXER_CHANNEL_MAX) {
+            g_channel_left[channel] = left;
+            g_channel_right[channel] = right;
+        }
+    }
+    lua_pushinteger(L, channel);
+    return 1;
+}
+
+static int l_playmusic(lua_State *L)
+{
+    MixerEntry *entry = mixer_find(L, 1, 2);
+    lua_Integer loops = luaL_optinteger(L, 2, 0);
+    int volume = mixer_volume(L, 3, 255);
+
+    if (!entry)
+        return 0;
+    if (loops < -1 || loops > 1000000)
+        return luaL_error(L, "draw.playmusic: loops must be -1 or non-negative");
+    Mix_VolumeMusic(volume);
+    if (Mix_PlayMusic(entry->music, (int)loops) != 0)
+        return luaL_error(L, "draw.playmusic: %s", Mix_GetError());
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_stopmusic(lua_State *L)
+{
+    Mix_HaltMusic();
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_musicpause(lua_State *L)
+{
+    int pause = lua_isnoneornil(L, 1) ? !Mix_PausedMusic() :
+                (lua_toboolean(L, 1) ? 1 : 0);
+
+    if (pause)
+        Mix_PauseMusic();
+    else
+        Mix_ResumeMusic();
+    lua_pushboolean(L, Mix_PausedMusic());
+    return 1;
+}
+
+static int l_musicplaying(lua_State *L)
+{
+    lua_pushboolean(L, Mix_PlayingMusic() && !Mix_PausedMusic());
+    return 1;
+}
+
+static int l_musicvolume(lua_State *L)
+{
+    if (!lua_isnoneornil(L, 1))
+        Mix_VolumeMusic(mixer_volume(L, 1, 255));
+    lua_pushinteger(L, Mix_VolumeMusic(-1));
+    return 1;
+}
+
+static int l_mastervolume(lua_State *L)
+{
+    if (!lua_isnoneornil(L, 1))
+        Mix_Volume(-1, mixer_volume(L, 1, 255));
+    lua_pushinteger(L, Mix_Volume(-1, -1));
+    return 1;
+}
+
+static int l_channelvolume(lua_State *L)
+{
+    int channel = (int)luaL_checkinteger(L, 1);
+
+    if (channel < 0)
+        return luaL_error(L, "draw.channelvolume: invalid channel");
+    if (!lua_isnoneornil(L, 2))
+        Mix_Volume(channel, mixer_volume(L, 2, 255));
+    lua_pushinteger(L, Mix_Volume(channel, -1));
+    return 1;
+}
+
+static int l_channelpan(lua_State *L)
+{
+    int channel = (int)luaL_checkinteger(L, 1);
+    int left, right;
+
+    if (channel < 0)
+        return luaL_error(L, "draw.channelpan: invalid channel");
+    if (lua_isnoneornil(L, 2)) {
+        if (channel >= MIXER_CHANNEL_MAX)
+            return luaL_error(L, "draw.channelpan: invalid channel");
+        lua_pushnumber(L, (double)(g_channel_right[channel] -
+                                   g_channel_left[channel]) / 255.0);
+        return 1;
+    }
+
+    {
+        double pan = luaL_checknumber(L, 2);
+
+        if (!isfinite(pan) || pan < -1.0 || pan > 1.0)
+            return luaL_error(L, "draw.channelpan: pan must be -1..1");
+        left = (int)(255.0 * (1.0 - pan) * 0.5 + 0.5);
+        right = (int)(255.0 * (1.0 + pan) * 0.5 + 0.5);
+        if (Mix_SetPanning(channel, left, right) != 0)
+            return luaL_error(L, "draw.channelpan: %s", Mix_GetError());
+        if (channel < MIXER_CHANNEL_MAX) {
+            g_channel_left[channel] = left;
+            g_channel_right[channel] = right;
+        }
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_stopchannel(lua_State *L)
+{
+    int channel = (int)luaL_checkinteger(L, 1);
+
+    if (channel < 0)
+        return luaL_error(L, "draw.stopchannel: invalid channel");
+    Mix_HaltChannel(channel);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_listener(lua_State *L)
+{
+    if (!lua_isnoneornil(L, 1)) {
+        double x = luaL_checknumber(L, 1);
+        double y = luaL_checknumber(L, 2);
+        double spread = luaL_optnumber(L, 3, g_listener_spread);
+
+        if (!isfinite(x) || !isfinite(y) || !isfinite(spread) || spread <= 0.0)
+            return luaL_error(L, "draw.listener: invalid position or spread");
+        g_listener_x = x;
+        g_listener_y = y;
+        g_listener_spread = spread;
+    }
+    lua_pushnumber(L, g_listener_x);
+    lua_pushnumber(L, g_listener_y);
+    lua_pushnumber(L, g_listener_spread);
+    return 3;
+}
+
+static int l_mixerremove(lua_State *L)
+{
+    MixerEntry *entry = mixer_find(L, 1, lua_isnoneornil(L, 2) ? 1 :
+                                   (int)luaL_checkinteger(L, 2));
+
+    if (!entry)
+        return 0;
+    if (entry->chunk)
+        Mix_FreeChunk(entry->chunk);
+    if (entry->music)
+        Mix_FreeMusic(entry->music);
+    memset(entry, 0, sizeof(*entry));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_mixercount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < MIXER_ASSET_MAX; ++i) {
+        if (g_mixer_assets[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static ShaderEntry *shader_find_arg(lua_State *L, int index)
+{
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        lua_Integer id = luaL_checkinteger(L, index);
+
+        return shader_by_id(id);
+    }
+    if (lua_type(L, index) == LUA_TSTRING) {
+        int id = find_shader_name(lua_tostring(L, index));
+
+        return id > 0 ? &g_shaders[id - 1] : NULL;
+    }
+    return NULL;
+}
+
+static int l_shader(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    const char *fragment = luaL_checkstring(L, 2);
+    const char *vertex = luaL_optstring(L, 3, g_shader_default_vertex);
+    char log[1024];
+    ShaderEntry *entry = NULL;
+    GLuint program;
+    size_t name_len = strlen(name);
+    int i;
+
+    if (!ensure_open(L, "draw.shader") || !g_draw.gl_ready)
+        return luaL_error(L, "draw.shader: OpenGL shaders are unavailable");
+    if (name_len == 0 || name_len >= SHADER_NAME_MAX)
+        return luaL_error(L, "draw.shader: invalid name");
+    if (strlen(fragment) == 0 || strlen(fragment) >= SHADER_SOURCE_MAX)
+        return luaL_error(L, "draw.shader: invalid fragment source");
+    if (strlen(vertex) == 0 || strlen(vertex) >= SHADER_SOURCE_MAX)
+        return luaL_error(L, "draw.shader: invalid vertex source");
+
+    for (i = 0; i < SHADER_MAX; ++i) {
+        if (g_shaders[i].used && strcmp(g_shaders[i].name, name) == 0)
+            return luaL_error(L, "draw.shader: '%s' is already defined", name);
+        if (!g_shaders[i].used && !entry)
+            entry = &g_shaders[i];
+    }
+    if (!entry)
+        return luaL_error(L, "draw.shader: limit of %d shaders reached",
+                          SHADER_MAX);
+
+    program = shader_link_program(vertex, fragment, log, sizeof(log));
+    if (!program)
+        return luaL_error(L, "draw.shader: %s",
+                          log[0] != '\0' ? log : "shader compilation failed");
+
+    memset(entry, 0, sizeof(*entry));
+    entry->used = 1;
+    strcpy(entry->name, name);
+    entry->program = program;
+    lua_pushinteger(L, (lua_Integer)(entry - g_shaders + 1));
+    return 1;
+}
+
+static int l_setshader(lua_State *L)
+{
+    int previous = g_active_shader;
+    ShaderEntry *entry;
+
+    if (!ensure_open(L, "draw.setshader") || !g_draw.gl_ready)
+        return luaL_error(L, "draw.setshader: OpenGL shaders are unavailable");
+    if (lua_isnoneornil(L, 1) ||
+        (lua_type(L, 1) == LUA_TNUMBER && lua_tointeger(L, 1) == 0)) {
+        g_active_shader = 0;
+        lua_pushinteger(L, previous);
+        return 1;
+    }
+    entry = shader_find_arg(L, 1);
+    if (!entry)
+        return luaL_error(L, "draw.setshader: shader is not defined");
+    g_active_shader = (int)(entry - g_shaders + 1);
+    lua_pushinteger(L, previous);
+    return 1;
+}
+
+static int l_shaderparam(lua_State *L)
+{
+    ShaderEntry *entry;
+    const char *name;
+    GLint location;
+    double values[4];
+    int count = lua_gettop(L);
+    int i;
+
+    if (!ensure_open(L, "draw.shaderparam") || !g_draw.gl_ready)
+        return luaL_error(L, "draw.shaderparam: OpenGL shaders are unavailable");
+    entry = shader_find_arg(L, 1);
+    if (!entry)
+        return luaL_error(L, "draw.shaderparam: shader is not defined");
+    name = luaL_checkstring(L, 2);
+    if (name[0] == '\0' || count < 3 || count > 6)
+        return luaL_error(L, "draw.shaderparam: expected name and 1..4 values");
+    for (i = 0; i < count - 2; ++i) {
+        values[i] = luaL_checknumber(L, 3 + i);
+        if (!isfinite(values[i]))
+            return luaL_error(L, "draw.shaderparam: values must be finite");
+    }
+
+    glUseProgram(entry->program);
+    location = glGetUniformLocation(entry->program, name);
+    if (location >= 0) {
+        if (count == 3)
+            glUniform1f(location, (float)values[0]);
+        else if (count == 4)
+            glUniform2f(location, (float)values[0], (float)values[1]);
+        else if (count == 5)
+            glUniform3f(location, (float)values[0], (float)values[1],
+                        (float)values[2]);
+        else
+            glUniform4f(location, (float)values[0], (float)values[1],
+                        (float)values[2], (float)values[3]);
+    }
+    glUseProgram(shader_active_program());
+    lua_pushboolean(L, location >= 0);
+    return 1;
+}
+
+static int l_shaderremove(lua_State *L)
+{
+    ShaderEntry *entry;
+
+    if (!ensure_open(L, "draw.shaderremove") || !g_draw.gl_ready)
+        return luaL_error(L, "draw.shaderremove: OpenGL shaders are unavailable");
+    entry = shader_find_arg(L, 1);
+    if (!entry)
+        return luaL_error(L, "draw.shaderremove: shader is not defined");
+    if (entry->program) {
+        glDeleteProgram(entry->program);
+        entry->program = 0;
+    }
+    if (g_active_shader == (int)(entry - g_shaders + 1))
+        g_active_shader = 0;
+    memset(entry, 0, sizeof(*entry));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_shadercount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < SHADER_MAX; ++i) {
+        if (g_shaders[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static int l_particle(lua_State *L)
+{
+    lua_Number x = luaL_checknumber(L, 1);
+    lua_Number y = luaL_checknumber(L, 2);
+    lua_Number vx = luaL_optnumber(L, 3, 0.0);
+    lua_Number vy = luaL_optnumber(L, 4, 0.0);
+    lua_Number life = luaL_checknumber(L, 5);
+    lua_Integer size = luaL_optinteger(L, 7, 4);
+    lua_Number gravity = luaL_optnumber(L, 8, 0.0);
+    lua_Number drag = luaL_optnumber(L, 9, 1.0);
+    ParticleEntry *entry = NULL;
+    int r, g, b, a;
+    int i;
+
+    if (!isfinite(x) || !isfinite(y) || !isfinite(vx) || !isfinite(vy) ||
+        !isfinite(life) || !isfinite(gravity) || !isfinite(drag) ||
+        fabs(x) > 1000000000.0 || fabs(y) > 1000000000.0 ||
+        fabs(vx) > 1000000000.0 || fabs(vy) > 1000000000.0)
+        return luaL_error(L, "draw.particle: values are out of range");
+    if (life <= 0.0 || life > 60.0)
+        return luaL_error(L, "draw.particle: life must be greater than 0 and at most 60");
+    if (size < 1 || size > 64)
+        return luaL_error(L, "draw.particle: size must be 1..64");
+    if (drag <= 0.0 || drag > 1.0)
+        return luaL_error(L, "draw.particle: drag must be greater than 0 and at most 1");
+    if (read_color(L, 6, &r, &g, &b, &a) < 0)
+        return luaL_error(L, "draw.particle: expected a color");
+
+    for (i = 0; i < PARTICLE_MAX; ++i) {
+        if (!g_particles[i].used) {
+            entry = &g_particles[i];
+            break;
+        }
+    }
+    if (!entry)
+        return luaL_error(L, "draw.particle: limit of %d particles reached",
+                          PARTICLE_MAX);
+
+    memset(entry, 0, sizeof(*entry));
+    entry->used = 1;
+    entry->x = (double)x;
+    entry->y = (double)y;
+    entry->vx = (double)vx;
+    entry->vy = (double)vy;
+    entry->life = (double)life;
+    entry->max_life = (double)life;
+    entry->gravity = (double)gravity;
+    entry->drag = (double)drag;
+    entry->size = (int)size;
+    entry->r = r;
+    entry->g = g;
+    entry->b = b;
+    entry->a = a;
+    lua_pushinteger(L, (lua_Integer)(entry - g_particles + 1));
+    return 1;
+}
+
+static int l_emit(lua_State *L)
+{
+    lua_Number x = luaL_checknumber(L, 1);
+    lua_Number y = luaL_checknumber(L, 2);
+    lua_Integer count = luaL_checkinteger(L, 3);
+    lua_Number speed = luaL_checknumber(L, 4);
+    lua_Number life = luaL_checknumber(L, 5);
+    lua_Integer size = luaL_optinteger(L, 7, 4);
+    lua_Number angle = luaL_optnumber(L, 8, 0.0);
+    lua_Number spread = luaL_optnumber(L, 9, 360.0);
+    lua_Number gravity = luaL_optnumber(L, 10, 0.0);
+    lua_Number drag = luaL_optnumber(L, 11, 1.0);
+    double base = (double)angle * AUX_PI / 180.0;
+    double range = fabs((double)spread) * AUX_PI / 360.0;
+    int r, g, b, a;
+    int free_count = 0;
+    int i;
+
+    if (!isfinite(x) || !isfinite(y) || !isfinite(speed) || !isfinite(life) ||
+        !isfinite(angle) || !isfinite(spread) || !isfinite(gravity) ||
+        !isfinite(drag) || fabs(x) > 1000000000.0 ||
+        fabs(y) > 1000000000.0 || fabs(speed) > 1000000000.0 ||
+        fabs(angle) > 1000000000.0 || fabs(spread) > 1000000000.0)
+        return luaL_error(L, "draw.emit: values are out of range");
+    if (count < 1 || count > 256)
+        return luaL_error(L, "draw.emit: count must be 1..256");
+    if (speed < 0.0 || speed > 1000000000.0)
+        return luaL_error(L, "draw.emit: speed must be between 0 and 1000000000");
+    if (life <= 0.0 || life > 60.0)
+        return luaL_error(L, "draw.emit: life must be greater than 0 and at most 60");
+    if (size < 1 || size > 64)
+        return luaL_error(L, "draw.emit: size must be 1..64");
+    if (drag <= 0.0 || drag > 1.0)
+        return luaL_error(L, "draw.emit: drag must be greater than 0 and at most 1");
+    if (read_color(L, 6, &r, &g, &b, &a) < 0)
+        return luaL_error(L, "draw.emit: expected a color");
+    for (i = 0; i < PARTICLE_MAX; ++i) {
+        if (!g_particles[i].used)
+            ++free_count;
+    }
+    if (free_count < count)
+        return luaL_error(L, "draw.emit: not enough free particles");
+
+    for (i = 0; i < (int)count; ++i) {
+        ParticleEntry *entry = NULL;
+        double dir = base + range * ((double)rand() / (double)RAND_MAX * 2.0 - 1.0);
+        int j;
+
+        for (j = 0; j < PARTICLE_MAX; ++j) {
+            if (!g_particles[j].used) {
+                entry = &g_particles[j];
+                break;
+            }
+        }
+        memset(entry, 0, sizeof(*entry));
+        entry->used = 1;
+        entry->x = (double)x;
+        entry->y = (double)y;
+        entry->vx = cos(dir) * (double)speed;
+        entry->vy = sin(dir) * (double)speed;
+        entry->life = (double)life * (0.75 + 0.25 *
+            ((double)rand() / (double)RAND_MAX));
+        entry->max_life = (double)life;
+        entry->gravity = (double)gravity;
+        entry->drag = (double)drag;
+        entry->size = (int)size;
+        entry->r = r;
+        entry->g = g;
+        entry->b = b;
+        entry->a = a;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static int l_particlecount(lua_State *L);
+
+static int l_particleupdate(lua_State *L)
+{
+    double dt = aux_step(L, 1, "draw.particleupdate");
+
+    particle_update(dt);
+    lua_pushinteger(L, l_particlecount(L));
+    return 1;
+}
+
+static int l_particledraw(lua_State *L)
+{
+    if (!ensure_open(L, "draw.particledraw"))
+        return 0;
+    particle_draw_all();
+    return 0;
+}
+
+static int l_particleclear(lua_State *L)
+{
+    particle_clear_state();
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_particlecount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < PARTICLE_MAX; ++i) {
+        if (g_particles[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
+static int l_tween(lua_State *L)
+{
+    lua_Number from = luaL_checknumber(L, 1);
+    lua_Number to = luaL_checknumber(L, 2);
+    lua_Number duration = luaL_checknumber(L, 3);
+    lua_Number delay = luaL_optnumber(L, 5, 0.0);
+    TweenEntry *entry = NULL;
+    int easing;
+    int i;
+
+    if (!isfinite(from) || !isfinite(to) || !isfinite(duration) ||
+        !isfinite(delay) || duration <= 0.0 || duration > 3600.0 ||
+        delay < 0.0 || delay > 3600.0)
+        return luaL_error(L, "draw.tween: invalid duration or delay");
+    easing = parse_easing(L, 4, "draw.tween");
+    for (i = 0; i < TWEEN_MAX; ++i) {
+        if (!g_tweens[i].used) {
+            entry = &g_tweens[i];
+            break;
+        }
+    }
+    if (!entry)
+        return luaL_error(L, "draw.tween: limit of %d tweens reached",
+                          TWEEN_MAX);
+
+    memset(entry, 0, sizeof(*entry));
+    entry->used = 1;
+    entry->from = (double)from;
+    entry->to = (double)to;
+    entry->delay = (double)delay;
+    entry->duration = (double)duration;
+    entry->easing = easing;
+    lua_pushinteger(L, (lua_Integer)(entry - g_tweens + 1));
+    return 1;
+}
+
+static int l_tweenvalue(lua_State *L)
+{
+    lua_Integer id = luaL_checkinteger(L, 1);
+    const TweenEntry *entry;
+
+    if (id < 1 || id > TWEEN_MAX || !g_tweens[id - 1].used)
+        return luaL_error(L, "draw.tweenvalue: tween is not defined");
+    entry = &g_tweens[id - 1];
+    lua_pushnumber(L, (lua_Number)tween_value(entry));
+    lua_pushboolean(L, tween_finished(entry));
+    return 2;
+}
+
+static int l_tweenupdate(lua_State *L)
+{
+    double dt = aux_step(L, 1, "draw.tweenupdate");
+    int active = 0;
+    int i;
+
+    tween_update(dt);
+    for (i = 0; i < TWEEN_MAX; ++i) {
+        if (g_tweens[i].used && !tween_finished(&g_tweens[i]))
+            ++active;
+    }
+    lua_pushinteger(L, active);
+    return 1;
+}
+
+static int l_tweenremove(lua_State *L)
+{
+    lua_Integer id = luaL_checkinteger(L, 1);
+
+    if (id < 1 || id > TWEEN_MAX || !g_tweens[id - 1].used)
+        return luaL_error(L, "draw.tweenremove: tween is not defined");
+    memset(&g_tweens[id - 1], 0, sizeof(g_tweens[id - 1]));
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_tweenclear(lua_State *L)
+{
+    tween_clear_state();
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_tweencount(lua_State *L)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < TWEEN_MAX; ++i) {
+        if (g_tweens[i].used)
+            ++count;
+    }
+    lua_pushinteger(L, count);
+    return 1;
+}
+
 static const HelpEntry g_help_entries[] = {
     {"open", "draw.open(width, height, [fps])",
      "Открывает окно; fps по умолчанию 60."},
@@ -7035,6 +11542,8 @@ static const HelpEntry g_help_entries[] = {
      "Рисует окружность; цвет — имя палитры или {r, g, b, [a]}."},
     {"square", "draw.square(x, y, w, h, color, [fill], [angle])",
      "Рисует прямоугольник с поворотом вокруг центра; углы в градусах."},
+    {"gradient", "draw.gradient(x, y, w, h, color1, color2, [mode])",
+     "Заливает прямоугольник градиентом; mode: vertical, horizontal, diagonal, radial."},
     {"triangle", "draw.triangle(x1, y1, x2, y2, x3, y3, color, [fill])",
      "Рисует треугольник; цвет — имя палитры или {r, g, b, [a]}."},
     {"text", "draw.text(x, y, text, [font], [color])",
@@ -7051,6 +11560,106 @@ static const HelpEntry g_help_entries[] = {
      "Создаёт анимацию из кадров."},
     {"draw", "draw.draw(x, y, name, [scale], [angle], [flip], [tint], [pivot])",
      "Рисует спрайт; flip={flipx,flipy}, pivot={pivotx,pivoty}, nil допустим."},
+    {"canvas", "draw.canvas(width, height, [color]) -> id",
+     "Создаёт прозрачный буфер; color или {r,g,b,[a]} заливает его."},
+    {"setcanvas", "draw.setcanvas([id]) -> previous",
+     "Перенаправляет рисование в буфер; без id — обратно в окно."},
+    {"canvasclear", "draw.canvasclear([color])",
+     "Заливает текущий буфер прозрачным или указанным цветом."},
+    {"canvassize", "draw.canvassize(id) -> width, height",
+     "Возвращает размер буфера."},
+    {"canvasremove", "draw.canvasremove(id) -> boolean",
+     "Удаляет буфер; active буфер сбрасывается в окно."},
+    {"canvascount", "draw.canvascount() -> count",
+     "Возвращает количество буферов."},
+    {"canvasdraw", "draw.canvasdraw(id, x, y, [scale], [angle], [flip], [tint], [pivot], [alpha])",
+     "Рисует буфер; без pivot (x, y) — левый верхний угол."},
+    {"shader", "draw.shader(name, fragment_source, [vertex_source]) -> id",
+     "Компилирует GLSL-шейдер для постобработки кадра."},
+    {"setshader", "draw.setshader([id or name]) -> previous",
+     "Включает шейдер; без аргумента — обычный вывод."},
+    {"shaderparam", "draw.shaderparam(id or name, uniform, x[, y[, z[, w]]]) -> boolean",
+     "Передаёт float/vec2/vec3/vec4 в шейдер."},
+    {"shaderremove", "draw.shaderremove(id or name) -> boolean",
+     "Удаляет шейдер."},
+    {"shadercount", "draw.shadercount() -> count",
+     "Возвращает количество шейдеров."},
+    {"particle", "draw.particle(x, y, vx, vy, life, color, [size], [gravity], [drag]) -> id",
+     "Создаёт одну частицу."},
+    {"emit", "draw.emit(x, y, count, speed, life, color, [size], [angle], [spread], [gravity], [drag]) -> count",
+     "Создаёт вспышку частиц; angle и spread в градусах."},
+    {"particleupdate", "draw.particleupdate([dt]) -> count",
+     "Двигает частицы; по умолчанию dt = draw.delta()."},
+    {"particledraw", "draw.particledraw()",
+     "Рисует частицы в текущую цель."},
+    {"particleclear", "draw.particleclear() -> boolean",
+     "Удаляет все частицы."},
+    {"particlecount", "draw.particlecount() -> count",
+     "Возвращает количество частиц."},
+    {"tween", "draw.tween(from, to, duration, [easing], [delay]) -> id",
+     "Создаёт твин; easing: linear, quadin, quadout, quadinout, cubicout, sineinout, backout, elasticout."},
+    {"tweenvalue", "draw.tweenvalue(id) -> value, done",
+     "Возвращает текущее значение твина и признак завершения."},
+    {"tweenupdate", "draw.tweenupdate([dt]) -> active",
+     "Продвигает твины; по умолчанию dt = draw.delta()."},
+    {"tweenremove", "draw.tweenremove(id) -> boolean",
+     "Удаляет твин."},
+    {"tweenclear", "draw.tweenclear() -> boolean",
+     "Удаляет все твины."},
+    {"tweencount", "draw.tweencount() -> count",
+     "Возвращает количество твинов."},
+    {"sample", "draw.sample(name, path) -> id",
+     "Загружает SDL_mixer sample: WAV, OGG или другой поддерживаемый формат."},
+    {"music", "draw.music(name, path) -> id",
+     "Загружает потоковую музыку: OGG, MP3, MOD и другие форматы."},
+    {"playsample", "draw.playsample(name, [volume], [loops], [x], [y], [pan]) -> channel",
+     "Играет sample; x/y включают пространственное затухание и pan."},
+    {"playmusic", "draw.playmusic(name, [loops], [volume]) -> boolean",
+     "Играет музыку; loops = -1 — бесконечно."},
+    {"stopmusic", "draw.stopmusic() -> boolean",
+     "Останавливает музыку."},
+    {"musicpause", "draw.musicpause([pause]) -> boolean",
+     "Ставит на паузу или продолжает музыку."},
+    {"musicplaying", "draw.musicplaying() -> boolean",
+     "Возвращает true, если музыка играет не на паузе."},
+    {"musicvolume", "draw.musicvolume([volume]) -> volume",
+     "Задаёт или возвращает громкость музыки."},
+    {"mastervolume", "draw.mastervolume([volume]) -> volume",
+     "Задаёт или возвращает общую громкость sample."},
+    {"channelvolume", "draw.channelvolume(channel, [volume]) -> volume",
+     "Задаёт или возвращает громкость канала."},
+    {"channelpan", "draw.channelpan(channel, [pan]) -> pan | boolean",
+     "Возвращает или задаёт панораму: -1 слева, 0 центр, 1 справа."},
+    {"stopchannel", "draw.stopchannel(channel) -> boolean",
+     "Останавливает канал."},
+    {"listener", "draw.listener([x], [y], [spread]) -> x, y, spread",
+     "Задаёт или возвращает слушателя для пространственного звука."},
+    {"mixerremove", "draw.mixerremove(name, [kind]) -> boolean",
+     "Удаляет sample или музыку; kind: 1 sample, 2 music."},
+    {"mixercount", "draw.mixercount() -> count",
+     "Возвращает количество загруженных sample и music."},
+    {"ttf", "draw.ttf(name, path, ptsize, [style], [outline]) -> id",
+     "Загружает TTF; style: normal, bold, italic, underline, strikethrough."},
+    {"ttftext", "draw.ttftext(x, y, font, text, [color], [alpha])",
+     "Рисует UTF-8 текст TTF-шрифтом; alpha — 0..1 или 2..255."},
+    {"ttfsize", "draw.ttfsize(font, text) -> width, height",
+     "Возвращает размер отрендеренной строки."},
+    {"ttfremove", "draw.ttfremove(font) -> boolean",
+     "Удаляет шрифт и кэш его строк."},
+    {"ttfcount", "draw.ttfcount() -> count",
+     "Возвращает количество TTF-шрифтов."},
+    {"tilemap", "draw.tilemap(name, rows, tiles, size, [solid]) -> id",
+     "Создаёт карту из строк или таблиц; solid — true или список индексов."},
+    {"drawtilemap", "draw.drawtilemap(name, [camx], [camy])",
+     "Рисует карту с камерой; cam по умолчанию draw.camera()."},
+    {"camera", "draw.camera([x], [y]) -> x, y",
+     "Возвращает или задаёт верхний левый угол камеры в мире."},
+    {"screentoworld", "draw.screentoworld(x, y) -> worldx, worldy",
+     "Переводит координаты экрана в координаты мира через камеру."},
+    {"tilemapremove", "draw.tilemapremove(name) -> boolean",
+     "Удаляет карту и созданные ею статические тела."},
+    {"tilemapcount", "draw.tilemapcount() -> count",
+     "Возвращает количество карт."},
     {"collision", "draw.collision(a, b) -> boolean",
      "Проверяет пересечение спрайтов и фигур попиксельно."},
     {"contactangle", "draw.contactangle(a, b, old_b) -> angle, x, y | nil",
@@ -7065,6 +11674,46 @@ static const HelpEntry g_help_entries[] = {
      "Воспроизводит мелодию или звук."},
     {"stop", "draw.stop()",
      "Останавливает воспроизведение."},
+    {"physicsworld", "draw.physicsworld([gx], [gy]) -> gx, gy",
+     "Задаёт или возвращает гравитацию физического мира."},
+    {"physicsclear", "draw.physicsclear() -> boolean",
+     "Удаляет все тела и соединения."},
+    {"physicsbody", "draw.physicsbody(shape) -> id",
+     "Тело: circle, box, sprite или triangle; type dynamic/static/kinematic."},
+    {"physicsstep", "draw.physicsstep([dt]) -> contacts",
+     "Шагает физика; dt по умолчанию draw.delta()."},
+    {"physicsdraw", "draw.physicsdraw([color])",
+     "Рисует тела: спрайты или фигуры."},
+    {"physicsposition", "draw.physicsposition(id) -> x, y, angle",
+     "Возвращает положение и угол тела."},
+    {"physicsvelocity", "draw.physicsvelocity(id) -> vx, vy, omega",
+     "Возвращает скорость тела."},
+    {"physicssetposition", "draw.physicssetposition(id, x, y, [angle])",
+     "Устанавливает положение тела."},
+    {"physicssetvelocity", "draw.physicssetvelocity(id, vx, vy, [omega])",
+     "Устанавливает скорость тела."},
+    {"physicsapplyforce", "draw.physicsapplyforce(id, fx, fy)",
+     "Добавляет силу к телу."},
+    {"physicsapplyimpulse", "draw.physicsapplyimpulse(id, ix, iy)",
+     "Применяет импульс к телу."},
+    {"physicsfilter", "draw.physicsfilter(id, [category], [mask]) -> category, mask",
+     "Проверяет или задаёт биты фильтрации столкновений."},
+    {"physicsremove", "draw.physicsremove(id) -> boolean",
+     "Удаляет тело и связанные соединения."},
+    {"physicscontacts", "draw.physicscontacts() -> table",
+     "Контакты последнего шага."},
+    {"physicscallback", "draw.physicscallback([fn]) -> boolean",
+     "Устанавливает или снимает функцию столкновений."},
+    {"physicsjoint", "draw.physicsjoint(kind, a, b, [options]) -> id",
+     "Соединение distance, spring или pin."},
+    {"physicsjointremove", "draw.physicsjointremove(id) -> boolean",
+     "Удаляет соединение."},
+    {"physicsraycast", "draw.physicsraycast(x1, y1, x2, y2, [cat], [mask]) -> hit | nil",
+     "Ближайшее попадание луча: id, x, y, nx, ny, t."},
+    {"physicsbodycount", "draw.physicsbodycount() -> number",
+     "Возвращает число тел."},
+    {"physicsjointcount", "draw.physicsjointcount() -> number",
+     "Возвращает число соединений."},
     {"help", "draw.help([command])",
      "Печатает список команд или справку по команде."}
 };
@@ -7112,6 +11761,9 @@ static void auto_close(void)
     free_fonts();
     free_sprites();
     free_palette();
+    physics_clear_state();
+    free_canvases();
+    free_tilemaps();
     IMG_Quit();
 }
 
@@ -7143,6 +11795,7 @@ static const luaL_Reg draw_lib[] = {
     {"line",    l_line},
     {"circle",  l_circle},
     {"square",  l_square},
+    {"gradient", l_gradient},
     {"triangle", l_triangle},
     {"text",    l_text},
     {"palette", l_palette},
@@ -7151,8 +11804,78 @@ static const luaL_Reg draw_lib[] = {
     {"font",    l_font},
     {"animation", l_animation},
     {"draw",    l_draw_sprite},
+    {"canvas",  l_canvas},
+    {"setcanvas", l_setcanvas},
+    {"canvasclear", l_canvasclear},
+    {"canvassize", l_canvassize},
+    {"canvasremove", l_canvasremove},
+    {"canvascount", l_canvascount},
+    {"canvasdraw", l_canvasdraw},
+    {"shader", l_shader},
+    {"setshader", l_setshader},
+    {"shaderparam", l_shaderparam},
+    {"shaderremove", l_shaderremove},
+    {"shadercount", l_shadercount},
+    {"particle", l_particle},
+    {"emit", l_emit},
+    {"particleupdate", l_particleupdate},
+    {"particledraw", l_particledraw},
+    {"particleclear", l_particleclear},
+    {"particlecount", l_particlecount},
+    {"tween", l_tween},
+    {"tweenvalue", l_tweenvalue},
+    {"tweenupdate", l_tweenupdate},
+    {"tweenremove", l_tweenremove},
+    {"tweenclear", l_tweenclear},
+    {"tweencount", l_tweencount},
+    {"sample", l_sample},
+    {"music", l_music},
+    {"playsample", l_playsample},
+    {"playmusic", l_playmusic},
+    {"stopmusic", l_stopmusic},
+    {"musicpause", l_musicpause},
+    {"musicplaying", l_musicplaying},
+    {"musicvolume", l_musicvolume},
+    {"mastervolume", l_mastervolume},
+    {"channelvolume", l_channelvolume},
+    {"channelpan", l_channelpan},
+    {"stopchannel", l_stopchannel},
+    {"listener", l_listener},
+    {"mixerremove", l_mixerremove},
+    {"mixercount", l_mixercount},
+    {"ttf", l_ttf},
+    {"ttftext", l_ttftext},
+    {"ttfsize", l_ttfsize},
+    {"ttfremove", l_ttfremove},
+    {"ttfcount", l_ttfcount},
+    {"tilemap", l_tilemap},
+    {"drawtilemap", l_drawtilemap},
+    {"camera", l_camera},
+    {"screentoworld", l_screentoworld},
+    {"tilemapremove", l_tilemapremove},
+    {"tilemapcount", l_tilemapcount},
     {"collision", l_collision},
     {"contactangle", l_contactangle},
+    {"physicsworld", l_physicsworld},
+    {"physicsclear", l_physicsclear},
+    {"physicsbody", l_physicsbody},
+    {"physicsstep", l_physicsstep},
+    {"physicsdraw", l_physicsdraw},
+    {"physicsposition", l_physicsposition},
+    {"physicsvelocity", l_physicsvelocity},
+    {"physicssetposition", l_physicssetposition},
+    {"physicssetvelocity", l_physicssetvelocity},
+    {"physicsapplyforce", l_physicsapplyforce},
+    {"physicsapplyimpulse", l_physicsapplyimpulse},
+    {"physicsfilter", l_physicsfilter},
+    {"physicsremove", l_physicsremove},
+    {"physicscontacts", l_physicscontacts},
+    {"physicscallback", l_physicscallback},
+    {"physicsjoint", l_physicsjoint},
+    {"physicsjointremove", l_physicsjointremove},
+    {"physicsraycast", l_physicsraycast},
+    {"physicsbodycount", l_physicsbodycount},
+    {"physicsjointcount", l_physicsjointcount},
     {"melody",  l_melody},
     {"midi",    l_midi},
     {"sound",   l_sound},

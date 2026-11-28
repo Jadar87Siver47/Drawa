@@ -31,7 +31,16 @@ draw.close()
 - Угол первого касания `draw.contactangle(a, b, old_b)`: направление, куда нужно оттолкнуть движущийся объект.
 - Анимации спрайтов: `draw.animation()` задаёт кадры и FPS, `draw.draw()` принимает имя анимации.
 - Альфа-смешивание: глобальная прозрачность `draw.alpha()`, alpha в палитре и `tint`.
-- Звук: мелодии из нот, частот и пауз, MIDI-файлы, WAV-файлы, формы волны `sine`/`square`/`triangle`/`saw`, до 8 голосов одновременно; SDL_mixer не нужен.
+- Градиенты: `draw.gradient()` с вертикальным, горизонтальным, диагональным и радиальным переходом.
+- SDL_mixer: потоковая музыка OGG/MP3/MOD, сэмплы, панорама и пространственный звук.
+- TTF: загрузка шрифтов через SDL2_ttf, UTF-8 текст, кэш строк, style и outline.
+- Tilemap: до 32 карт из строк или таблиц, камера и автоматические статические тела для твёрдых тайлов.
+- Canvas: до 64 дополнительных пиксельных буферов с выводом через `draw.canvasdraw()`.
+- Shaders: OpenGL 2.1/GLSL 120 постобработка всего кадра через `draw.shader()` и `draw.setshader()`.
+- Частицы: до 2048 частиц, вспышки `draw.emit()` и обновление с затуханием.
+- Твины: до 128 анимированных значений с easing-функциями и polling завершения.
+- Физика: компактный встроенный решатель с телами, соединениями, фильтрами и raycast.
+- Звук: мелодии из нот, частот и пауз, MIDI-файлы, WAV-файлы, формы волны `sine`/`square`/`triangle`/`saw`, до 8 голосов одновременно; SDL_mixer для потоковых форматов.
 - Ввод: удержание и одноразовые нажатия клавиш, координаты и кнопки мыши, движение курсора, колесо.
 - Встроенная справка: `draw.help()` печатает список команд, `draw.help(name)` — описание команды.
 - Текст встроенным монохромным шрифтом 8×8 в четырёх размерах и шрифтами из PNG-атласов.
@@ -44,21 +53,24 @@ draw.close()
 ## Требования
 
 - Lua 5.2, 5.3 или 5.4 (см. примечание про 5.1/LuaJIT ниже).
-- SDL2 — разработческие файлы; аудио использует SDL2 audio, отдельный SDL_mixer не нужен.
+- SDL2 — разработческие файлы; базовое аудио использует SDL2 audio, потоковое аудио — SDL2_mixer.
 - SDL2_image — разработческие файлы для загрузки картинок и шрифтовых атласов.
+- SDL2_ttf — разработческие файлы для TTF-шрифтов.
+- SDL2_mixer — разработческие файлы для OGG/MP3/MOD и пространственного звука.
+- OpenGL 2.1 — разработческие файлы (`libGL`) для шейдеров постобработки.
 - Компилятор C с поддержкой C11.
 - CMake 3.16+ либо GCC/Clang для ручной сборки.
 
 Для Debian/Ubuntu:
 
 ```bash
-sudo apt install build-essential cmake libsdl2-dev libsdl2-image-dev liblua5.4-dev lua5.4
+sudo apt install build-essential cmake libgl1-mesa-dev libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev libsdl2-mixer-dev liblua5.4-dev lua5.4
 ```
 
 Для Fedora:
 
 ```bash
-sudo dnf install gcc cmake SDL2-devel SDL2_image-devel lua-devel lua
+sudo dnf install gcc cmake mesa-libGL-devel SDL2-devel SDL2_image-devel SDL2_ttf-devel SDL2_mixer-devel lua-devel lua
 ```
 
 ### Примечание про Lua 5.1 и LuaJIT
@@ -87,7 +99,8 @@ cmake --build build
 Готовый модуль появится в `build/draw.so` (Linux и macOS) или `build/draw.dll` (Windows).
 На macOS CMake тоже даёт расширение `.so` — именно такое имя Lua ищет в `package.cpath`.
 
-CMake ищет SDL2 через `find_package(SDL2 CONFIG REQUIRED)`, SDL2_image — через `pkg-config`
+CMake ищет SDL2 через `find_package(SDL2 CONFIG REQUIRED)`, OpenGL — через
+`find_package(OpenGL REQUIRED)`, SDL2_image — через `pkg-config`
 на Linux/macOS и через `find_package(SDL2_image CONFIG REQUIRED)` на Windows, а Lua — через
 `find_package(Lua 5.1 REQUIRED)`, то есть подходит любая версия не ниже 5.1. Если пакеты лежат
 в нестандартных местах, укажите пути вручную:
@@ -105,7 +118,7 @@ cmake -S . -B build \
 
 ```bash
 gcc -O2 -Wall -Wextra -fPIC -shared -o draw.so draw.c \
-    $(pkg-config --cflags --libs lua5.4 sdl2 SDL2_image) -lm
+    $(pkg-config --cflags --libs lua5.4 sdl2 SDL2_image SDL2_ttf SDL2_mixer) -lGL -lm
 ```
 
 Готовый `draw.so` должен лежать в текущем каталоге, в `package.cpath` или в каталоге из `LUA_CPATH`.
@@ -270,6 +283,23 @@ draw.square(20, 20, 80, 40, "orange")
 draw.square(20, 20, 80, 40, "orange", -1)
 draw.square(20, 20, 80, 40, {255, 80, 40, 1}, 2)
 draw.square(100, 100, 40, 20, "orange", 0, 45)
+```
+
+### `draw.gradient(x, y, w, h, color1, color2, [mode])`
+
+Заливает прямоугольник плавным переходом между двумя цветами. Переход s-образный, поэтому
+края выглядят мягче, чем при линейной интерполяции.
+
+- `mode` — `"vertical"` (по умолчанию), `"horizontal"`, `"diagonal"` или `"radial"`;
+  допустимы сокращения `"v"`, `"h"`, `"d"`, `"r"`.
+- `color1` и `color2` задаются в формате имени палитры или `{r, g, b, [a]}`; альфа тоже
+  интерполируется.
+- Отрицательные `w`/`h` нормализуются; `w = 0` или `h = 0` ничего не рисует.
+- Градиент рисуется в текущую цель: окно или canvas.
+
+```lua
+draw.gradient(0, 0, 400, 240, {20, 10, 50}, {90, 40, 120}, "vertical")
+draw.gradient(0, 0, 400, 240, "bg", "sky", "radial")
 ```
 
 ### `draw.triangle(x1, y1, x2, y2, x3, y3, color, [fill])`
@@ -631,6 +661,376 @@ if angle then
 end
 ```
 
+## Потоковое аудио SDL_mixer
+
+Старые `draw.melody`, `draw.midi`, `draw.sound`, `draw.play` и `draw.stop` работают как
+раньше через SDL2 audio. Дополнительно доступен слой SDL_mixer для потоковой музыки,
+сэмплов, панорамы и простого пространственного звука.
+
+```lua
+local step = draw.sample("step", "sounds/step.wav")
+local song = draw.music("song", "music/theme.ogg")
+
+draw.listener(0, 0, 320)
+draw.playsample(step, 0.6, 0, 100, 0)
+draw.playmusic(song, -1, 0.4)
+```
+
+Команды:
+
+- `draw.sample(name, path) -> id` — загружает сэмпл через `Mix_LoadWAV`.
+- `draw.music(name, path) -> id` — загружает музыку через `Mix_LoadMUS`: OGG, MP3, MOD и
+  другие форматы зависимости SDL_mixer.
+- `draw.playsample(name, [volume], [loops], [x], [y], [pan]) -> channel` — играет сэмпл;
+  `loops = -1` — бесконечно. Если заданы `x`/`y`, громкость убывает до нуля на расстоянии
+  `spread` от слушателя, а панорама вычисляется из `x` автоматически.
+- `draw.playmusic(name, [loops], [volume]) -> boolean`, `draw.stopmusic()`,
+  `draw.musicpause([pause]) -> boolean`, `draw.musicplaying() -> boolean`.
+- `draw.musicvolume([volume]) -> volume`, `draw.mastervolume([volume]) -> volume`,
+  `draw.channelvolume(channel, [volume]) -> volume`.
+- `draw.channelpan(channel, [pan]) -> pan | boolean` — возвращает или задаёт панораму
+  канала: `-1` слева, `0` центр, `1` справа.
+- `draw.stopchannel(channel) -> boolean`.
+- `draw.listener([x], [y], [spread]) -> x, y, spread` — позиция слушателя и радиус звука.
+- `draw.mixerremove(name, [kind]) -> boolean`, `draw.mixercount() -> count`.
+  `kind`: `1` — сэмпл, `2` — музыка.
+
+Громкость задаётся числом `0..1` или `2..255`. Ограничение: до 64 сэмплов/композиций.
+
+## TTF-шрифты
+
+Для настоящего текста используется SDL2_ttf. Шрифт загружается один раз, строки кэшируются
+в виде RGBA-поверхностей, поэтому повторный вывод той же строки не вызывает перерисовку
+глифов. Поддерживается UTF-8, включая кириллицу.
+
+```lua
+local font = draw.ttf("main", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                      16, "bold", 1)
+draw.ttftext(10, 10, font, "Привет", {255, 220, 120}, 0.8)
+local width, height = draw.ttfsize(font, "Привет")
+```
+
+Команды:
+
+- `draw.ttf(name, path, ptsize, [style], [outline]) -> id` — загружает шрифт;
+  `ptsize` — `1..256`, `outline` — `0..8`. `style` может быть числом-битовой маской SDL_ttf
+  или строкой `normal`, `bold`, `italic`, `underline`, `strikethrough`.
+- `draw.ttftext(x, y, font, text, [color], [alpha])` — рисует текст; `font` — id или имя,
+  `color` — имя палитры или `{r, g, b, [a]}`, `alpha` — `0..1` или `2..255`.
+- `draw.ttfsize(font, text) -> width, height` — размер уже отрендеренной строки.
+- `draw.ttfremove(font) -> boolean`, `draw.ttfcount() -> count`.
+
+Шрифты и кэш строк сохраняются между `draw.open`/`draw.close`. Ограничения: до 32 шрифтов,
+до 256 строк в кэше и до 8192 байт на строку.
+
+## Tilemap и камера
+
+Tilemap хранит сетку тайлов и рисует её с учётом камеры. Каждый тайл ссылается на спрайт
+того же или любого размера: при выводе спрайт растягивается на `size × size`.
+
+```lua
+draw.sprite("grass", tile_rows, {"grass"})
+draw.sprite("stone", tile_rows, {"stone"})
+
+draw.tilemap("level", {
+    "11.....",
+    "....11.",
+}, {"grass", "stone"}, 16, {1})
+
+draw.camera(120, 40)
+draw.drawtilemap("level")
+local world_x, world_y = draw.screentoworld(10, 10)
+```
+
+`rows` — таблица строк. В строке каждый символ задаёт индекс тайла: `0..9` — индексы
+`0..9`, `a..z` — `10..35`, `A..Z` — `36..61`; `.` и пробел — пусто. Можно передать и
+таблицу строк с числами, где `-1` или `nil` означают пусто. `tiles` — список имён
+спрайтов, начинающийся с индекса `0` (первый элемент Lua-таблицы).
+
+Команды:
+
+- `draw.tilemap(name, rows, tiles, size, [solid]) -> id` — создаёт карту. `solid = true`
+  делает твёрдыми все непустые тайлы; таблица, например `{1, 2}`, задаёт твёрдые индексы.
+  Для каждого твёрдого тайла создаётся статическое физическое тело `box` размером
+  `size × size` с центром в центре тайла.
+- `draw.drawtilemap(name, [camx], [camy])` — рисует видимые тайлы. Без `camx`/`camy`
+  используется `draw.camera()`.
+- `draw.camera([x], [y]) -> x, y` — возвращает или задаёт координаты левого верхнего угла
+  камеры в мировых координатах.
+- `draw.screentoworld(x, y) -> worldx, worldy` — переводит точку экрана в мир.
+- `draw.tilemapremove(name) -> boolean`, `draw.tilemapcount() -> count`.
+
+`draw.physicsclear()` и `draw.open()` удаляют созданные картой физические тела, но сами
+карты сохраняются. Ограничения: до 32 карт, до 256 строк и 256 столбцов, до 64 типов
+тайлов, размер тайла `1..4096` и до 512 статических тел на карту.
+
+## Canvas
+
+Canvas — это дополнительный пиксельный буфер, в который можно перенаправить любые команды
+рисования, а затем вывести его на экран как спрайт. Буферы хранятся отдельно от окна и
+переживают `draw.open`/`draw.close`, но автоматически удаляются при выходе из Lua.
+
+```lua
+local bg = draw.canvas(400, 300, "bg")
+draw.setcanvas(bg)
+draw.line(0, 40, 400, 40, "grid", 1)
+draw.setcanvas(nil)
+
+draw.clear("bg")
+draw.canvasdraw(bg, 0, 0)
+draw.present()
+```
+
+Команды:
+
+- `draw.canvas(width, height, [color]) -> id` — создаёт буфер, по умолчанию прозрачный;
+  `color` задаёт заливку в формате имени палитры или `{r, g, b, [a]}`.
+- `draw.setcanvas([id]) -> previous` — включает буфер как цель рисования; без `id`
+  возвращает вывод в окно. Возвращает предыдущую цель: `0` — окно, иначе `id` буфера.
+- `draw.canvasclear([color])` — заливает текущую цель прозрачным чёрным или указанным
+  цветом. Для окна обычно используется `draw.clear`.
+- `draw.canvassize(id) -> width, height` — размер буфера.
+- `draw.canvascount() -> count` — количество созданных буферов.
+- `draw.canvasremove(id) -> boolean` — удаляет буфер; если он был активен, цель сбрасывается
+  в окно.
+- `draw.canvasdraw(id, x, y, [scale], [angle], [flip], [tint], [pivot], [alpha])` — рисует
+  буфер с теми же параметрами, что `draw.draw`: `scale`, `angle` в градусах, `flip` как
+  `{flipx, flipy}`, `tint` как `{r, g, b, [a]}`, `pivot` как `{pivotx, pivoty}`, `alpha`
+  в формате `0..1` или `2..255`. Поворот — `1°`; без `pivot` точка `(x, y)` — левый верхний угол.
+
+Пока активен canvas, `draw.width()` и `draw.height()` возвращают размер окна, а не буфера;
+координаты мыши тоже остаются в системе координат окна. Перед `draw.present()` цель
+автоматически сбрасывается в окно, поэтому буфер нельзя случайно оставить активным между
+кадрами. Нельзя рисовать буфер в самого себя.
+
+Ограничения: до 64 буферов, размер стороны `1..4096`, площадь одного буфера до 4194304
+пикселей и суммарная площадь всех буферов до 16777216 пикселей.
+
+## Shaders
+
+Шейдеры работают как постобработка готового кадра: команды рисования сначала формируют
+пиксельный буфер окна, а `draw.present()` выводит его через OpenGL как текстуру на полноэкранный
+квад. Это быстро и просто, но шейдер пока один на весь кадр: VPC/спрайт-шейдеров, как в LÖVE,
+нет. Если OpenGL недоступен, `draw.open()` делает fallback на обычный SDL2-рендерер, а команды
+шейдеров сообщают об ошибке.
+
+Используется OpenGL 2.1 и GLSL 120. Для фрагментного шейдера по умолчанию доступны:
+
+- `varying vec2 v_texcoord` — координаты текстуры кадра;
+- `uniform sampler2D u_texture` — готовый кадр;
+- `uniform vec2 u_resolution` — размер окна в пикселях;
+- `uniform float u_time` — секунды с момента `draw.open()`.
+
+Вершинный шейдер по умолчанию использует `attribute vec2 a_position` и `attribute vec2 a_uv`.
+Свой вершинный шейдер можно передать третьим аргументом, но имена `a_position`/`a_uv` должны
+совпадать с ожидаемой раскладкой VBO. На выходе шейдер должен выдавать непрозрачный кадр;
+стандартный фрагментный шейдер делает `vec4(c.rgb * c.a, 1.0)`.
+
+Сразу после `draw.open()` доступен встроенный шейдер `"soft"`. Он аккуратно размывает кадр
+фильтром 3×3 и смешивает размытие с оригиналом; параметр `u_softness` в диапазоне `0..1`
+управляет силой эффекта, по умолчанию `0.35`.
+
+```lua
+draw.setshader("soft")
+draw.shaderparam("soft", "u_softness", 0.5)
+```
+
+```lua
+local gray = draw.shader("gray", [[
+varying vec2 v_texcoord;
+uniform sampler2D u_texture;
+
+void main() {
+    vec4 c = texture2D(u_texture, v_texcoord);
+    float g = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+    gl_FragColor = vec4(vec3(g) * c.a, 1.0);
+}
+]])
+
+draw.setshader(gray)
+draw.shaderparam(gray, "u_time", os.clock())
+draw.setshader(nil)
+```
+
+Команды:
+
+- `draw.shader(name, fragment_source, [vertex_source]) -> id` — компилирует шейдер; один и тот же
+  `name` нельзя определить дважды.
+- `draw.setshader([id or name]) -> previous` — включает шейдер; `nil` или `0` возвращает обычный
+  вывод. Возвращает предыдущий активный шейдер.
+- `draw.shaderparam(id or name, uniform, x[, y[, z[, w]]]) -> boolean` — передаёт
+  `float`/`vec2`/`vec3`/`vec4`; `false` означает, что uniform не найден или оптимизирован.
+- `draw.shaderremove(id or name) -> boolean` — удаляет шейдер и сбрасывает его, если он был активен.
+- `draw.shadercount() -> count` — количество созданных шейдеров, включая встроенный `"soft"`.
+
+Ограничение: до 32 шейдеров, один слот занят встроенным `"soft"`.
+ В OpenGL-пути `draw.present()` загружает весь кадр в текстуру
+каждый раз, поэтому инкрементальное обновление по dirty-rect здесь не используется. Координаты
+мыши и дельта колеса учитывают letterbox между окном и игровым буфером.
+
+## Частицы
+
+Частицы хранятся в одном глобальном пуле на 2048 объектов. Они не зависят от физики и не
+сталкиваются с миром; цвет, размер и затухание задаются при создании.
+
+```lua
+draw.emit(200, 120, 24, 90, 0.6, {255, 190, 90}, 4, 0, 360, 240, 0.92)
+draw.particleupdate()
+draw.particledraw()
+```
+
+Команды:
+
+- `draw.particle(x, y, vx, vy, life, color, [size], [gravity], [drag]) -> id` — одна частица;
+  `gravity` в px/с², `drag` — множитель скорости за секунду (`1` без затухания).
+- `draw.emit(x, y, count, speed, life, color, [size], [angle], [spread], [gravity], [drag]) -> count`
+  — вспышка: направления распределены вокруг `angle` в пределах `spread` градусов.
+- `draw.particleupdate([dt]) -> count` — обновление; `dt` по умолчанию `draw.delta()`.
+- `draw.particledraw()` — рисует частицы в текущую цель; alpha убывает к концу жизни.
+- `draw.particleclear() -> boolean`, `draw.particlecount() -> count`.
+
+Ограничения: `dt` в `0..1`, `life` в `(0, 60]`, `size` в `1..64`, `drag` в `(0, 1]`, за один
+`draw.emit()` не больше 256 частиц.
+
+## Твины
+
+Твины помогают делать плавные переходы без callbacks: можно получить текущее значение в
+игровом цикле и проверять признак завершения.
+
+```lua
+local id = draw.tween(0, 300, 1.2, "sineinout")
+while true do
+    draw.tweenupdate()
+    local x, done = draw.tweenvalue(id)
+    draw.square(x, 10, 20, 20, "ball")
+    if done then break end
+    draw.present()
+end
+```
+
+Команды:
+
+- `draw.tween(from, to, duration, [easing], [delay]) -> id` — создаёт твин; `duration` и
+  `delay` в секундах, `easing` по умолчанию `"quadout"`.
+- `draw.tweenvalue(id) -> value, done` — текущее значение и признак завершения.
+- `draw.tweenupdate([dt]) -> active` — продвигает все твины; возвращает число незавершённых.
+- `draw.tweenremove(id) -> boolean`, `draw.tweenclear() -> boolean`, `draw.tweencount() -> count`.
+
+Easing: `"linear"`, `"quadin"`, `"quadout"`, `"quadinout"`, `"cubicout"`, `"sineinout"`,
+`"backout"`, `"elasticout"`. Ограничения: до 128 твинов, `dt` в `0..1`, `duration` в `(0, 3600]`.
+
+## Физика
+
+Физика встроена в `draw`, использует одно глобальное состояние и не требует внешних
+библиотек. Единицы измерения — пиксели и секунды, углы — градусы. Тела возвращают целые
+`id`, которые передаются в остальные команды. `draw.open`/`draw.close` очищают физический
+мир; палитра и спрайты при этом сохраняются.
+
+| Команда | Возврат | Что делает |
+|---|---|---|
+| `draw.physicsworld([gx], [gy])` | `gx, gy` | Задаёт или возвращает гравитацию; по умолчанию `0, 0`. |
+| `draw.physicsclear()` | `boolean` | Удаляет все тела и соединения. |
+| `draw.physicsbody(shape)` | `id` | Создаёт тело. |
+| `draw.physicsstep([dt])` | число контактов | Выполняет шаг симуляции. |
+| `draw.physicsdraw([color])` | — | Рисует все тела. |
+| `draw.physicsposition(id)` | `x, y, angle` | Положение и угол тела. |
+| `draw.physicsvelocity(id)` | `vx, vy, omega` | Линейная и угловая скорость. |
+| `draw.physicssetposition(id, x, y, [angle])` | — | Телепортирует тело. |
+| `draw.physicssetvelocity(id, vx, vy, [omega])` | — | Задаёт скорость. |
+| `draw.physicsapplyforce(id, fx, fy)` | — | Добавляет силу до следующего шага. |
+| `draw.physicsapplyimpulse(id, ix, iy)` | — | Мгновенно меняет скорость. |
+| `draw.physicsfilter(id, [category], [mask])` | `category, mask` | Читает или задаёт фильтр столкновений. |
+| `draw.physicsremove(id)` | `boolean` | Удаляет тело и его соединения. |
+| `draw.physicscontacts()` | таблица | Контакты последнего шага. |
+| `draw.physicscallback([fn])` | `boolean` | Устанавливает или снимает обработчик контактов. |
+| `draw.physicsjoint(kind, a, b, [options])` | `id` | Создаёт соединение. |
+| `draw.physicsjointremove(id)` | `boolean` | Удаляет соединение. |
+| `draw.physicsraycast(x1, y1, x2, y2, [cat], [mask])` | `id, x, y, nx, ny, t` или `nil` | Ближайшее попадание луча. |
+| `draw.physicsbodycount()` | число | Число тел. |
+| `draw.physicsjointcount()` | число | Число соединений. |
+
+### Тела
+
+`draw.physicsbody` принимает одну таблицу с описанием формы и свойствами тела:
+
+- `{circle={radius=10}}` — круг радиуса `radius`.
+- `{box={width=20, height=12}}` — прямоугольник со сторонами `width`/`height`, поворачивается вместе с телом.
+- `{sprite="hero", [scale=2]}` — ориентированный прямоугольник по размеру спрайта; форма спрайта — bbox, а не попиксельная маска.
+- `{triangle={x1=0, y1=-8, x2=8, y2=8, x3=-8, y3=8}}` или `{triangle={-8,-8, 8,8, -8,8}}` — треугольник в локальных координатах центра тела.
+
+Общие поля:
+
+- `x`, `y` — центр тела, по умолчанию `0, 0`.
+- `angle` — начальный угол в градусах; `vx`, `vy` — скорость в пикселях/с; `omega` — угловая скорость в градусах/с.
+- Скорость ограничена: `vx`/`vy` — `±1000000` пикселей/с, `omega` — `±720` градусов/с.
+- `type` — `"dynamic"` (по умолчанию), `"static"` или `"kinematic"`.
+- `mass`, `density` — масса или плотность; масса по умолчанию считается как площадь × `0.001`.
+- `restitution` `0..1` (по умолчанию `0`), `friction` `0..1000` (по умолчанию `0.5`).
+- `lineardamping`, `angulardamping` — затухание, по умолчанию `0`.
+- `sensor` — если `true`, тело только сообщает о контактах и не сталкивается.
+- `category`, `mask` — 32-битные биты фильтрации; по умолчанию `0xffffffff`.
+- `color` — имя палитры для `draw.physicsdraw`.
+
+Статические и кинематические тела не ускоряются гравитацией и не отталкиваются.
+Всего одновременно до 512 тел и 256 соединений.
+
+### Шаг, контакты и отрисовка
+
+`draw.physicsstep([dt])` интегрирует движение, ищет контакты и решает их за 2 подшага по
+6 итераций. Без `dt` берётся `draw.delta()`; `dt` больше `1/30` ограничивается. Возвращается
+число контактов; их список доступен через `draw.physicscontacts()`:
+`{a=id, b=id, x=..., y=..., nx=..., ny=..., sensor=true/false}`.
+
+`draw.physicscallback(fn)` вызывает `fn(a, b, x, y, nx, ny, sensor)` один раз на контакт после
+шага. `draw.physicscallback(nil)` снимает обработчик. Из колбэка нельзя удалять тела —
+сначала соберите `id`, а изменения примените после `physicsstep()`.
+
+`draw.physicsdraw([color])` рисует все тела: для тела с `sprite` вызывается обычный
+`draw.draw` с центром в позиции тела и его углом; остальные тела рисуются залитыми
+фигурами. Цвет по умолчанию — белый или `color` тела. Для ручной синхронизации используйте
+`draw.physicsposition()` и `pivot` у `draw.draw`.
+
+### Сенсоры, фильтры и соединения
+
+Контакт считается, если `(category_a & mask_b) != 0` и `(category_b & mask_a) != 0`.
+Сенсоры участвуют в фильтрации и колбэке, но не создают импульсов отталкивания.
+
+`draw.physicsjoint(kind, a, b, [options])` поддерживает:
+
+- `"distance"` — удерживает расстояние между центрами; опции `length`, `stiffness` `0..1`, `damping`.
+- `"spring"` — пружина между центрами; опции `rest`, `stiffness` `0..10000`, `damping`.
+- `"pin"` — соединяет локальные точки `ax, ay` тела `a` и `bx, by` тела `b`; опции `stiffness` `0..1`, `damping`.
+
+`draw.physicsraycast()` возвращает ближайшее попадание: `id` тела, точку `x, y`,
+нормаль `nx, ny`, направленную навстречу лучу, и `t` — долю длины луча `0..1`.
+
+```lua
+draw.physicsworld(0, 600)
+local floor = draw.physicsbody({
+    box={width=320, height=20}, x=160, y=220, type="static",
+    color="gray"
+})
+local ball = draw.physicsbody({
+    circle={radius=10}, x=40, y=20, restitution=0.4, friction=0.6,
+    color="orange"
+})
+
+draw.physicscallback(function(a, b, x, y, nx, ny, sensor)
+    if not sensor then draw.play("hit") end
+end)
+
+while true do
+    draw.clear({18, 18, 24, 1})
+    if draw.keypress("space") then
+        draw.physicsapplyimpulse(ball, 0, -180)
+    end
+    draw.physicsstep()
+    draw.physicsdraw()
+    if not draw.present() then break end
+end
+draw.close()
+```
+
 ## Звук
 
 ### `draw.melody(name, notes) -> index`
@@ -887,7 +1287,7 @@ draw.close()
 - Одно глобальное окно на процесс.
 - Альфа-смешивание только source-over; других режимов (add, multiply) нет.
 - Нет антиалиасинга: фигуры и текст рисуются по правилу «центр пикселя внутри фигуры».
-- Текст только ASCII `32..127`, встроенный шрифт 8×8 (масштабируется до 4, 8, 16, 24 px).
+- Встроенный шрифт 8×8 поддерживает только ASCII `32..127` (4 масштаба); TTF-шрифты поддерживают UTF-8.
 - Поворот спрайта выполняется с шагом 1°, без сглаживания.
 - Спрайтов не больше 1024 штук; максимальный масштаб — 1 000 000.
 - Анимаций не больше 1024, в каждой до 1024 кадров.
@@ -895,7 +1295,10 @@ draw.close()
 - Одновременно играют не больше 8 голосов; WAV-файлы до 64 МиБ.
 - Палитра глобальная и динамическая: не больше 1024 цветов, имена чувствительны к регистру,
   длина имени — до 63 символов. Имена мелодий тоже чувствительны к регистру и до 63 символов.
-- `draw.open` сбрасывает состояние рисования и ввода, но не палитру и не спрайты.
+- `draw.open` сбрасывает состояние рисования, ввода и камеру, но не палитру, спрайты, canvas, карты, шрифты и звуковые ресурсы.
+- Физика — компактный собственный решатель, не Box2D: используются круги, ориентированные
+  прямоугольники и треугольники; составных форм и точных попиксельных контуров тел нет.
+- Один физический мир на процесс, до 512 тел и 256 соединений; сенсоры не создают импульсов.
 - Масштабирование окна — ближайший сосед (`SDL_HINT_RENDER_SCALE_QUALITY = "0"`).
 - VSync запрашивается всегда, но программный ограничитель по `fps` работает независимо от него,
   так что фактическая частота не выше `min(fps, частота монитора)`.
